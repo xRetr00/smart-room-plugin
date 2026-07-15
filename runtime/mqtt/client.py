@@ -169,6 +169,10 @@ class MQTTClient:
                 self._on_geofence("enter", zone)
             elif event == "leave":
                 self._on_geofence("leave", zone)
+        elif event_type == "location":
+            regions = payload.get("inregions")
+            if isinstance(regions, list) and regions:
+                self._on_geofence("sync", str(regions[0]).strip().lower())
 
     def _handle_espresense(self, topic: str, payload: Dict[str, Any]) -> None:
         """Process ESPresense BLE presence data."""

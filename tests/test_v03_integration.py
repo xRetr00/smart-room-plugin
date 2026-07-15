@@ -134,6 +134,10 @@ def test_location_event_is_idempotent_and_schedules_work_return(monkeypatch):
     runtime._state.mmwave.occupied = True
     scheduled = MagicMock()
     monkeypatch.setattr(runtime, "_schedule_mode", scheduled)
+    runtime._on_geofence("sync", "home")
+    assert runtime._state.location.zone == "home"
+    assert runtime._state.location.source == "owntracks"
+    scheduled.assert_not_called()
     at = datetime.now(timezone.utc).isoformat()
     params = {
         "who": "Shereef", "transition": "ARRIVE", "zone": "Home",

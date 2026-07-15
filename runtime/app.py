@@ -289,6 +289,18 @@ class Runtime:
 
     def _on_geofence(self, action: str, zone: str) -> None:
         """Handle optional OwnTracks events through the same location path."""
+        if action == "sync":
+            with self._state_lock:
+                if self._state.location.zone == zone and self._state.location.source == "owntracks":
+                    return
+                stamp = now_iso()
+                self._state.location.zone = zone
+                self._state.location.home = zone == "home"
+                self._state.location.since = stamp
+                self._state.location.source = "owntracks"
+                self._state.location.last_geofence_at = stamp
+                self._update_presence(geofence_zone=zone)
+            return
         transition = "arrive" if action == "enter" else "leave"
         self.phone_location_changed(
             who=self._owner,
