@@ -51,7 +51,6 @@ smart_room:
     max_gap_ms: 900
     decision_ms: 650
     cooldown_ms: 3000
-    require_occupancy: true
   # ... see NEEDS_YOU_AT_HOME.md for full config
 ```
 

@@ -460,12 +460,6 @@ class Runtime:
 
     def _on_sound_action(self, action: str) -> None:
         """Apply a locally detected clap sequence without entering Marvi core."""
-        config = self._config.get("sound_events") or {}
-        if config.get("require_occupancy", True) and not (
-            self._state.mmwave.occupied or self._state.presence.detected
-        ):
-            logger.info("Ignoring sound action while the room is unoccupied: %s", action)
-            return
         if action == "toggle_light":
             current = self._state.light.on
             if self._tuya:

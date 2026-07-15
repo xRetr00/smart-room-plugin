@@ -58,9 +58,8 @@ def test_sound_actions_use_room_state_and_tuya_status() -> None:
             self.commands.append(kwargs)
             return {"success": True}
 
-    runtime = Runtime({"sound_events": {"require_occupancy": True}})
+    runtime = Runtime({})
     runtime._tuya = Tuya()
-    runtime._state.mmwave.occupied = True
 
     runtime._on_sound_action("toggle_light")
     assert runtime._tuya.commands[-1]["on"] is False
