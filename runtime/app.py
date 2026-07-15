@@ -100,6 +100,7 @@ class Runtime:
         self._tuya = None
         self._scheduler = None
         self._router = None
+        self._sound_events = None
         self._rpc_thread: Optional[threading.Thread] = None
         self._poll_thread: Optional[threading.Thread] = None
 
@@ -149,6 +150,18 @@ class Runtime:
         # Start device poller
         self._poll_thread = threading.Thread(target=self._device_poll_loop, daemon=True, name="smart_room_poll")
         self._poll_thread.start()
+
+        # Optional plugin-local clap detector. It owns its microphone and model;
+        # the Marvi core audio/STT path is intentionally not involved.
+        try:
+            from plugins.smart_room.runtime.sound_events import SoundEventListener
+
+            self._sound_events = SoundEventListener(
+                self._config.get("sound_events") or {}, self._on_sound_action
+            )
+            self._sound_events.start()
+        except Exception as e:
+            logger.warning("Sound events init failed (non-fatal): %s", e)
 
         logger.info("Smart room runtime started — RPC on port %d", _rpc_port())
 
@@ -444,6 +457,29 @@ class Runtime:
             self.set_light(brightness=payload.get("value", 50))
         elif action == "set_color":
             self.set_light(rgb=payload.get("rgb"))
+
+    def _on_sound_action(self, action: str) -> None:
+        """Apply a locally detected clap sequence without entering Marvi core."""
+        config = self._config.get("sound_events") or {}
+        if config.get("require_occupancy", True) and not (
+            self._state.mmwave.occupied or self._state.presence.detected
+        ):
+            logger.info("Ignoring sound action while the room is unoccupied: %s", action)
+            return
+        if action == "toggle_light":
+            current = self._state.light.on
+            if self._tuya:
+                status = self._tuya.get_light_status()
+                if status.get("success"):
+                    current = bool(status.get("on"))
+            self.set_light(on=not current, manual=True)
+            logger.info("Double clap toggled the light %s", "off" if current else "on")
+        elif action == "sleep":
+            if not self._state.modes.sleep:
+                self.set_mode("sleep", reason="sound_event")
+                logger.info("Triple clap activated sleep mode")
+        else:
+            logger.warning("Unknown sound action: %s", action)
 
     # -------------------------------------------------------------------
     # Device polling
@@ -889,6 +925,10 @@ class Runtime:
             "mqtt_connected": self._mqtt.connected if self._mqtt else False,
             "tuya_available": bool(self._tuya and self._tuya.available),
             "state_event_id": self._state.event_id,
+            "sound_events": self._sound_events.status() if self._sound_events else {
+                "enabled": False,
+                "running": False,
+            },
         }
 
     def _cleanup(self) -> None:
@@ -896,6 +936,8 @@ class Runtime:
         logger.info("Smart room runtime shutting down...")
         if self._scheduler:
             self._scheduler.stop()
+        if self._sound_events:
+            self._sound_events.stop()
         self._cancel_pending_mode()
         if self._pending_welcome_timer:
             self._pending_welcome_timer.cancel()

@@ -1,10 +1,13 @@
 name: smart_room
-version: 0.4.0
-description: "Smart room engine for Marvi — presence fusion (BLE + mmWave + geofence), Tuya LAN light control, automations, and world-awareness context. Native Windows, no Docker/WSL. Replaces Home Assistant for the smart room."
+version: 0.5.0
+description: "Smart room engine for Marvi — presence fusion, Tuya LAN control, automations, YAMNet clap controls, and world-awareness context. Native Windows, no Docker/WSL."
 author: xRetro Labs
 kind: backend
 platforms:
   - windows
+pip_dependencies:
+  - ai-edge-litert==2.1.6
+  - sounddevice==0.5.5
 provides_tools:
   - smart_room_state
   - smart_room_set_mode
