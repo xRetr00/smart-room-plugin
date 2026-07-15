@@ -90,6 +90,9 @@ class CommandRouter:
         health = check_device_health(self._state, self._config)
         runtime = self._runtime.get_status()
         health["mqtt"]["connected"] = bool(runtime.get("mqtt_connected"))
+        health["sound_events"] = runtime.get(
+            "sound_events", {"enabled": False, "running": False}
+        )
         return {"success": True, "health": health}
 
     def _handle_phone_location_changed(self, params: Dict[str, Any]) -> Dict[str, Any]:

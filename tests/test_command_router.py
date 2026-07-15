@@ -23,7 +23,12 @@ class TestCommandRouter:
         self.runtime.set_light = MagicMock()
         self.runtime.cancel_sleep = MagicMock()
         self.runtime.test_welcome = MagicMock()
-        self.runtime.get_status = MagicMock(return_value={"running": True})
+        self.runtime.get_status = MagicMock(
+            return_value={
+                "running": True,
+                "sound_events": {"enabled": True, "running": True},
+            }
+        )
         self.router = CommandRouter(self.state, self.config, self.runtime)
 
     def test_get_state_returns_snapshot(self):
@@ -62,6 +67,7 @@ class TestCommandRouter:
         result = self.router.dispatch("get_health", {})
         assert result["success"] is True
         assert "health" in result
+        assert result["health"]["sound_events"]["running"] is True
 
     def test_get_diagnostic_returns_full_dump(self):
         result = self.router.dispatch("get_diagnostic", {})
