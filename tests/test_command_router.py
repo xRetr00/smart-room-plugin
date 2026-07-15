@@ -29,7 +29,8 @@ class TestCommandRouter:
         result = self.router.dispatch("get_state", {})
         assert result["success"] is True
         assert "state" in result
-        assert result["state"]["last_updated"] is not None
+        assert result["state"]["last_updated"] is None
+        assert self.state.event_id == 0
 
     def test_set_mode_calls_runtime(self):
         result = self.router.dispatch("set_mode", {"mode": "reading"})
@@ -39,12 +40,12 @@ class TestCommandRouter:
     def test_set_light_calls_runtime(self):
         result = self.router.dispatch("set_light", {"on": True, "brightness": 50})
         assert result["success"] is True
-        self.runtime.set_light.assert_called_once_with(on=True, brightness=50)
+        self.runtime.set_light.assert_called_once_with(on=True, brightness=50, manual=True)
 
     def test_set_override_updates_state(self):
         result = self.router.dispatch("set_override", {"enabled": True})
         assert result["success"] is True
-        assert self.state.modes.manual_override is True
+        self.runtime.set_override.assert_called_once_with(True)
 
     def test_cancel_sleep_calls_runtime(self):
         result = self.router.dispatch("cancel_sleep", {})

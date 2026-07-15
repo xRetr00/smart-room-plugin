@@ -7,6 +7,7 @@ import json
 import socket
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -115,6 +116,22 @@ def test_he20_clear_event_is_delayed_and_edge_triggered(monkeypatch):
     runtime._poll_devices()
     runtime._poll_devices()
     assert emitted == [("presence_cleared", {"source": "mmwave"})]
+
+
+def test_welcome_requires_one_hour_empty(monkeypatch):
+    runtime = Runtime({
+        "owner": "Shereef",
+        "welcome": {"enabled": True, "reset_after_seconds": 3600, "identity_grace_seconds": 0},
+    })
+    runtime._state.room_empty_since = (datetime.now(timezone.utc) - timedelta(minutes=59)).isoformat()
+    timer = MagicMock()
+    monkeypatch.setattr(threading, "Timer", lambda *_args, **_kwargs: timer)
+    runtime._handle_welcome_transition(False, True)
+    timer.start.assert_not_called()
+
+    runtime._state.room_empty_since = (datetime.now(timezone.utc) - timedelta(hours=1, seconds=1)).isoformat()
+    runtime._handle_welcome_transition(False, True)
+    timer.start.assert_called_once()
 
 
 def test_location_event_is_idempotent_and_schedules_work_return(monkeypatch):

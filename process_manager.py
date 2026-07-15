@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+from contextlib import contextmanager
 import json
 import os
 import secrets
@@ -23,6 +24,34 @@ _supervisor_config: Dict[str, Any] = {}
 _supervisor_home: Optional[Path] = None
 _process: Optional[subprocess.Popen] = None
 _atexit_registered = False
+
+
+@contextmanager
+def _start_lock():
+    """Serialize runtime starts across Desktop, gateway, and test processes."""
+    _root().mkdir(parents=True, exist_ok=True)
+    with open(_root() / ".start.lock", "a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            if not handle.read(1):
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _root() -> Path:
@@ -126,6 +155,11 @@ def _managed_runtime_alive(active: Optional[Dict[str, Any]] = None) -> bool:
 
 
 def start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -> Dict[str, Any]:
+    with _start_lock():
+        return _start(config, restart_count=restart_count)
+
+
+def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -> Dict[str, Any]:
     """Start one runtime process, or return the live process already recorded."""
     global _process
     with _lock:

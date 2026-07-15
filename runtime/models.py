@@ -98,6 +98,8 @@ class RoomState:
     last_updated: Optional[str] = None
     event_id: int = 0  # monotonic event counter for subconscious cursor
     sleep_restore: Dict[str, Any] = field(default_factory=dict)
+    room_empty_since: Optional[str] = None
+    last_welcome_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to JSON-safe dict."""
@@ -138,6 +140,8 @@ class RoomState:
             state.event_id = d["event_id"]
         if "sleep_restore" in d and isinstance(d["sleep_restore"], dict):
             state.sleep_restore = d["sleep_restore"]
+        state.room_empty_since = d.get("room_empty_since")
+        state.last_welcome_at = d.get("last_welcome_at")
         return state
 
 

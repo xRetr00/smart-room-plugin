@@ -91,6 +91,21 @@ def append_transition(event: Dict[str, Any]) -> None:
         logger.debug("Failed to append smart-room activity", exc_info=True)
 
 
+def publish_welcome(message: str) -> None:
+    """Send one room greeting through Marvi's existing proactive delivery lane."""
+    try:
+        from cron.scheduler import record_subconscious_activity
+
+        record_subconscious_activity(
+            source="world",
+            outcome="message",
+            summary="Smart Room welcome",
+            thought=message,
+        )
+    except Exception:
+        logger.debug("Failed to publish smart-room welcome", exc_info=True)
+
+
 def load_transition_events(after_id: int = 0) -> list[Dict[str, Any]]:
     path = events_path()
     if not path.exists():

@@ -40,6 +40,7 @@ from plugins.smart_room.runtime.state_store import (
     append_transition,
     load_config,
     load_state,
+    publish_welcome,
     save_state,
 )
 from plugins.smart_room.runtime.event_bus import EventBus
@@ -76,6 +77,7 @@ class Runtime:
         self._exit_event = threading.Event()
         self._state_lock = threading.RLock()
         self._pending_mode_timer: Optional[threading.Timer] = None
+        self._pending_welcome_timer: Optional[threading.Timer] = None
         self._ble_detected = False
         self._ble_rssi: Optional[int] = None
         self._last_ble_seen_monotonic = 0.0
@@ -83,12 +85,15 @@ class Runtime:
         # for the configured timeout.  HE20 can briefly report "none" between
         # occupied samples, so a single clear poll must never turn lights off.
         self._room_clear_emitted = not self._state.mmwave.occupied
-        self._owner = str(config.get("owner", "shereef")).strip().lower()
+        self._owner_name = str(config.get("owner", "Shereef")).strip() or "Shereef"
+        self._owner = self._owner_name.lower()
         self._owner_device_id = str(
             (config.get("esp32") or {}).get("owner_device_id", "")
         ).strip().lower()
         self._rpc_token = os.environ.get("SMART_ROOM_RPC_TOKEN", "")
         self._last_wifi_probe = 0.0
+        if not self._state.mmwave.occupied and not self._state.room_empty_since:
+            self._state.room_empty_since = now_iso()
 
         # Initialize components (lazily — some need hardware present)
         self._mqtt = None
@@ -168,7 +173,10 @@ class Runtime:
     def _rpc_loop(self) -> None:
         """Listen for JSON-RPC requests on localhost TCP."""
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if sys.platform == "win32":
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             server.bind(("127.0.0.1", _rpc_port()))
         except OSError:
@@ -454,6 +462,7 @@ class Runtime:
     def _poll_devices(self) -> None:
         """Poll Tuya devices and update state."""
         was_present = self._state.presence.detected
+        was_occupied = self._state.mmwave.occupied
         if self._tuya:
             # Poll bulb
             bulb_status = self._tuya.get_light_status()
@@ -486,6 +495,8 @@ class Runtime:
                     self._emit_event("device_offline", {"device": "tuya_he20"})
                 he20.online = False
 
+        self._handle_welcome_transition(was_occupied, self._state.mmwave.occupied)
+
         wifi_detected = self._probe_wifi_presence()
         _, light_should_off = self._update_presence(wifi_detected=wifi_detected)
         if self._state.mmwave.occupied:
@@ -499,6 +510,87 @@ class Runtime:
         # Publish state via MQTT
         if self._mqtt:
             self._mqtt.publish_state(self._state.to_dict())
+
+    def _handle_welcome_transition(self, was_occupied: bool, occupied: bool) -> None:
+        welcome = self._config.get("welcome") or {}
+        if not welcome.get("enabled", True):
+            return
+        if not occupied:
+            if was_occupied:
+                self._state.room_empty_since = now_iso()
+                save_state(self._state)
+            return
+        if was_occupied:
+            return
+
+        empty_since = self._state.room_empty_since
+        self._state.room_empty_since = None
+        save_state(self._state)
+        try:
+            empty_at = datetime.fromisoformat(str(empty_since).replace("Z", "+00:00"))
+            empty_seconds = (datetime.now(timezone.utc) - empty_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            return
+        if empty_seconds < max(60, int(welcome.get("reset_after_seconds", 3600))):
+            return
+
+        if self._pending_welcome_timer:
+            self._pending_welcome_timer.cancel()
+        delay = max(0, int(welcome.get("identity_grace_seconds", 4)))
+        self._pending_welcome_timer = threading.Timer(delay, self._deliver_welcome)
+        self._pending_welcome_timer.daemon = True
+        self._pending_welcome_timer.start()
+
+    def _deliver_welcome(self) -> None:
+        self._pending_welcome_timer = None
+        with self._state_lock:
+            if not self._state.mmwave.occupied or self._state.modes.sleep:
+                return
+            owner_detected = self._ble_detected
+
+        fallback = f"Welcome back, {self._owner_name}." if owner_detected else "Welcome."
+        try:
+            from agent.auxiliary_client import call_llm
+            from agent.message_content import flatten_message_text
+            from agent.prompt_builder import load_soul_md
+
+            identity = (
+                f"The detected person is the owner, named {self._owner_name}. Include that exact name."
+                if owner_detected
+                else "The detected person is a guest whose name is unknown. Do not invent a name."
+            )
+            soul = (load_soul_md() or "")[:4000]
+            response = call_llm(
+                task="voice_instant",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Write exactly one short, natural spoken welcome in Marvi's personality. "
+                            "Vary the wording, use at most two brief sentences, and do not ask a question."
+                            + (f"\n\nMarvi personality:\n{soul}" if soul else "")
+                        ),
+                    },
+                    {"role": "user", "content": identity},
+                ],
+                temperature=0.9,
+                max_tokens=80,
+                timeout=20,
+            )
+            greeting = " ".join(flatten_message_text(response.choices[0].message.content).split()).strip(' "')
+            if not greeting:
+                greeting = fallback
+            if owner_detected and self._owner_name.casefold() not in greeting.casefold():
+                greeting = f"{self._owner_name}, {greeting[:1].lower()}{greeting[1:]}"
+            greeting = greeting[:300]
+        except Exception:
+            logger.warning("Could not generate room welcome; using fallback", exc_info=True)
+            greeting = fallback
+
+        publish_welcome(greeting)
+        with self._state_lock:
+            self._state.last_welcome_at = now_iso()
+            save_state(self._state)
 
     def _probe_wifi_presence(self) -> bool:
         config = (self._config.get("presence") or {}).get("wifi_ping") or {}
@@ -784,6 +876,9 @@ class Runtime:
         if self._scheduler:
             self._scheduler.stop()
         self._cancel_pending_mode()
+        if self._pending_welcome_timer:
+            self._pending_welcome_timer.cancel()
+            self._pending_welcome_timer = None
         if self._tuya:
             self._tuya.stop()
         if self._mqtt:
