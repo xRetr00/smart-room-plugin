@@ -25,11 +25,11 @@ def main():
         print("ERROR: tinytuya not installed. Run: pip install tinytuya")
         sys.exit(1)
 
-    print("Scanning for Tuya devices on local network (10 seconds)...")
+    print("Scanning for Tuya devices on local network...")
     print("(Make sure your Tuya devices are powered on and connected to Wi-Fi)")
     print()
 
-    devices = tinytuya.scan(maxretry=3, timeout=10)
+    devices = tinytuya.deviceScan(maxretry=10, poll=False)
 
     if not devices:
         print("No Tuya devices found. Make sure:")
@@ -41,8 +41,8 @@ def main():
     print(f"Found {len(devices)} device(s):\n")
 
     output = []
-    for dev in devices:
-        ip = dev.get("ip", "?")
+    for address, dev in devices.items():
+        ip = dev.get("ip", address)
         dev_id = dev.get("gwId", "?")
         version = dev.get("version", "?")
         product = dev.get("productKey", "?")
@@ -67,14 +67,11 @@ def main():
     print("   a. Go to https://iot.tuya.com/ (free account)")
     print("   b. Create a Cloud Development project")
     print("   c. Link your Smart Life app (scan QR code)")
-    print("   d. Go to Device Management → find your devices")
+    print("   d. Go to Device Management -> find your devices")
     print("   e. Copy the 'local_key' for each device")
-    print("3. Add to config.yaml under smart_room.tuya:")
-    print("   bulb:")
-    print(f"     ip: \"{output[0]['ip']}\"")
-    print(f"     device_id: \"{output[0]['device_id']}\"")
-    print("     local_key: \"<from Tuya portal>\"")
-    print("     protocol: \"3.3\"")
+    print("3. Match each discovered ID to the bulb or sensor, then add its")
+    print("   IP, device_id, and reported protocol under smart_room.tuya")
+    print("4. Save the local key in Desktop Settings -> Smart Room -> Save secrets")
 
     # Save to file for reference
     with open("tuya_devices_found.json", "w") as f:

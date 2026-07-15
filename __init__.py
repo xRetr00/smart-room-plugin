@@ -13,7 +13,6 @@ Key design principles (from v0.3 spec):
 
 from __future__ import annotations
 
-import logging
 import platform
 
 from plugins.smart_room.tools import (
@@ -34,8 +33,8 @@ from plugins.smart_room.tools import (
     handle_smart_room_diagnostic,
 )
 from plugins.smart_room.context import build_context_line
-
-logger = logging.getLogger(__name__)
+from plugins.smart_room import process_manager
+from plugins.smart_room.runtime.state_store import load_config
 
 _TOOLS = (
     ("smart_room_state",       SMART_ROOM_STATE_SCHEMA,       handle_smart_room_state,       "🏠"),
@@ -48,6 +47,16 @@ _TOOLS = (
 )
 
 
+def _on_gateway_start(**_kwargs) -> None:
+    config = load_config()
+    if config.get("enabled", False):
+        process_manager.start_supervisor(config)
+
+
+def _on_gateway_stop(**_kwargs) -> None:
+    process_manager.stop_supervisor()
+
+
 def register(ctx) -> None:
     """Register tools, CLI, and lifecycle hooks.
 
@@ -55,8 +64,8 @@ def register(ctx) -> None:
     ``plugins.enabled`` in config.yaml.
     """
     system = platform.system().lower()
-    if system not in {"windows", "linux", "darwin"}:
-        logger.info("smart_room plugin: platform=%s not supported", system)
+    if system != "windows":
+        logger.info("smart_room plugin: platform=%s not supported (Windows only)", system)
         return
 
     for name, schema, handler, emoji in _TOOLS:
@@ -74,5 +83,5 @@ def register(ctx) -> None:
         name="smart_room",
         handler=build_context_line,
     )
-
-    logger.info("smart_room plugin registered — %d tools, context provider active", len(_TOOLS))
+    ctx.register_hook("on_gateway_start", _on_gateway_start)
+    ctx.register_hook("on_gateway_stop", _on_gateway_stop)

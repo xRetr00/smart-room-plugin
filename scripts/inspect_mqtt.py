@@ -14,6 +14,7 @@ Install paho-mqtt first:
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -22,6 +23,8 @@ def main():
     parser.add_argument("--broker", default="127.0.0.1", help="MQTT broker IP")
     parser.add_argument("--port", type=int, default=1883, help="MQTT broker port")
     parser.add_argument("--duration", type=int, default=30, help="Listen duration (seconds)")
+    parser.add_argument("--username", default=os.getenv("SMART_ROOM_MQTT_USERNAME", ""), help="MQTT username (defaults to SMART_ROOM_MQTT_USERNAME)")
+    parser.add_argument("--password", default=os.getenv("SMART_ROOM_MQTT_PASSWORD", ""), help="MQTT password (defaults to SMART_ROOM_MQTT_PASSWORD)")
     args = parser.parse_args()
 
     try:
@@ -59,7 +62,12 @@ def main():
         print(f"  [{timestamp}] {msg.topic}: {payload_str}")
         messages.append({"topic": msg.topic, "payload": payload_str, "timestamp": timestamp})
 
-    client = mqtt.Client(client_id="smart_room_inspector")
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id="smart_room_inspector")
+    else:
+        client = mqtt.Client(client_id="smart_room_inspector")
+    if args.username:
+        client.username_pw_set(args.username, args.password)
     client.on_connect = on_connect
     client.on_message = on_message
 

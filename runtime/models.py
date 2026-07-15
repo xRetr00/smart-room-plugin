@@ -66,10 +66,12 @@ class DailyFlags:
 @dataclass
 class PhoneLocation:
     """Phone geofence state from OwnTracks."""
-    home: bool = True
-    zone: str = "home"  # "home", "university", "bakery", "away"
+    home: bool = False
+    zone: str = "unknown"  # "home", "university", "bakery", "away"
     since: Optional[str] = None
-    source: str = "owntracks"  # "owntracks", "ble", "unknown"
+    source: str = "unknown"  # "owntracks", "ble", "unknown"
+    last_geofence_at: Optional[str] = None
+    last_event_key: Optional[str] = None
 
 
 @dataclass
@@ -95,6 +97,7 @@ class RoomState:
     sun: Dict[str, Any] = field(default_factory=dict)
     last_updated: Optional[str] = None
     event_id: int = 0  # monotonic event counter for subconscious cursor
+    sleep_restore: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to JSON-safe dict."""
@@ -117,7 +120,10 @@ class RoomState:
         if "flags" in d:
             state.flags = DailyFlags(**d["flags"])
         if "location" in d:
-            state.location = PhoneLocation(**d["location"])
+            location = dict(d["location"])
+            # One-time migration from the removed iOS Shortcuts design.
+            location.setdefault("last_geofence_at", location.pop("last_webhook_at", None))
+            state.location = PhoneLocation(**location)
         if "devices" in d:
             state.devices = {
                 k: DeviceHealth(**v) for k, v in d["devices"].items()
@@ -130,6 +136,8 @@ class RoomState:
             state.last_updated = d["last_updated"]
         if "event_id" in d:
             state.event_id = d["event_id"]
+        if "sleep_restore" in d and isinstance(d["sleep_restore"], dict):
+            state.sleep_restore = d["sleep_restore"]
         return state
 
 

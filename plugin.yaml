@@ -14,5 +14,5 @@ provides_tools:
   - smart_room_health
   - smart_room_diagnostic
 hooks:
-  - on_session_start
-  - on_session_end
+  - on_gateway_start
+  - on_gateway_stop

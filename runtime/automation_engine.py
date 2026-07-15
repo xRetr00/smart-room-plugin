@@ -1,4 +1,4 @@
-"""Automation engine — all 14 automations ported from Home Assistant.
+"""Automation engine for adaptive light, modes, schedules, and daily flags.
 
 Each automation is a rule evaluated by the engine when events arrive.
 Rules are pure functions: (state, event) → list[actions].
@@ -8,11 +8,24 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
 from plugins.smart_room.runtime.models import RoomState, now_iso
 
 logger = logging.getLogger(__name__)
+
+
+def _inside_window(start: str, end: str, now: Optional[datetime] = None) -> bool:
+    current = now or datetime.now()
+    try:
+        start_h, start_m = map(int, start.split(":"))
+        end_h, end_m = map(int, end.split(":"))
+    except (AttributeError, TypeError, ValueError):
+        return True
+    minute = current.hour * 60 + current.minute
+    lower, upper = start_h * 60 + start_m, end_h * 60 + end_m
+    return lower <= minute <= upper if lower <= upper else minute >= lower or minute <= upper
 
 
 @dataclass
@@ -69,20 +82,33 @@ def evaluate_automations(
         }))
 
     # --- 4.6 Clear Alarm After Duration ---
+    if event_type == "schedule_alarm":
+        actions.append(Action(type="set_mode", params={"mode": "alarm", "reason": "schedule"}))
+
     if event_type == "alarm_duration_expired":
         actions.append(Action(type="set_mode", params={"mode": "off"}))
 
     # --- 4.7 Work Return Sleep ---
     work_cfg = auto_cfg.get("work_return", {})
-    if work_cfg.get("enabled", True) and event_type == "geofence_arrive_home":
-        if not state.flags.work_sleep_done_today and not state.flags.work_sleep_cancel_today:
-            actions.append(Action(type="set_mode", params={"mode": "sleep", "delay": work_cfg.get("settle_delay", 300)}))
+    if work_cfg.get("enabled", True) and event_type in {"geofence_arrive_home", "ble_arrive_fallback"}:
+        start = work_cfg.get("arrival_window_start", work_cfg.get("work_hours_start", "00:00"))
+        end = work_cfg.get("arrival_window_end", work_cfg.get("work_hours_end", "23:59"))
+        if (
+            _inside_window(start, end)
+            and not state.flags.work_sleep_done_today
+            and not state.flags.work_sleep_cancel_today
+        ):
+            actions.append(Action(type="set_mode", params={
+                "mode": "sleep",
+                "reason": "work_return",
+                "delay": work_cfg.get("settle_delay", 300),
+            }))
 
     # --- 4.8 Evening Sleep ---
     evening_cfg = auto_cfg.get("evening_sleep", {})
     if evening_cfg.get("enabled", True) and event_type == "schedule_evening_sleep":
         if not state.flags.evening_sleep_done_today and not state.flags.evening_sleep_cancel_today:
-            actions.append(Action(type="set_mode", params={"mode": "sleep"}))
+            actions.append(Action(type="set_mode", params={"mode": "sleep", "reason": "evening"}))
 
     # --- 4.12 Reset Daily Mode Flags ---
     if event_type == "schedule_daily_reset":

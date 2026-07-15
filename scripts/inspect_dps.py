@@ -6,13 +6,14 @@ and lists all available data points (DPS). Use this to determine
 which DPS control on/off, brightness, color, etc.
 
 Usage:
-    python scripts/inspect_dps.py --ip 192.168.1.50 --id <device_id> --key <local_key> [--protocol 3.3]
+    python scripts/inspect_dps.py --ip 192.168.1.50 --id <device_id> [--protocol 3.3]
 
 Install tinytuya first:
     pip install tinytuya
 """
 
 import argparse
+import getpass
 import json
 import sys
 
@@ -20,9 +21,12 @@ def main():
     parser = argparse.ArgumentParser(description="Inspect Tuya device data points")
     parser.add_argument("--ip", required=True, help="Device IP address")
     parser.add_argument("--id", required=True, dest="device_id", help="Device ID")
-    parser.add_argument("--key", required=True, help="Local key")
+    parser.add_argument("--key", help="Local key (discouraged: visible in process history)")
     parser.add_argument("--protocol", default="3.3", help="Protocol version (3.1, 3.2, 3.3, 3.4)")
     args = parser.parse_args()
+    local_key = args.key or getpass.getpass("Local key: ")
+    if not local_key:
+        parser.error("a local key is required")
 
     try:
         import tinytuya
@@ -35,6 +39,7 @@ def main():
     dev = tinytuya.Device(
         dev_id=args.device_id,
         address=args.ip,
+        local_key=local_key,
     )
     dev.set_version(float(args.protocol))
 

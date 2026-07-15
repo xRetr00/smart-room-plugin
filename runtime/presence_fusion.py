@@ -56,6 +56,8 @@ def fuse(
     mmwave_occupied: bool,
     geofence_zone: Optional[str],
     exit_timeout_elapsed: bool,
+    wifi_detected: bool = False,
+    other_identity_detected: bool = False,
 ) -> tuple[Presence, MmWaveState, PhoneLocation, bool, bool]:
     """Fuse all signals into updated presence state.
 
@@ -86,6 +88,23 @@ def fuse(
         presence.identity_sticky = False
         presence.sticky_since = None
         logger.debug("BLE detected — identity established (rssi=%s)", ble_rssi)
+
+    # Positive-only fallback identity signals require current room occupancy.
+    elif wifi_detected and mmwave_occupied:
+        presence.detected = True
+        presence.source = "wifi_mmwave"
+        presence.confidence = 0.75
+        presence.last_seen = now
+        presence.identity_sticky = False
+        presence.sticky_since = None
+
+    elif location.home and mmwave_occupied and not presence.detected:
+        presence.detected = True
+        presence.source = "geofence_mmwave"
+        presence.confidence = 0.7
+        presence.last_seen = now
+        presence.identity_sticky = False
+        presence.sticky_since = None
 
     # Case 2: BLE absent but mmWave occupied and identity was previously established
     elif not ble_detected and mmwave_occupied and (presence.detected or presence.identity_sticky):
@@ -119,13 +138,22 @@ def fuse(
             logger.debug("Room clear — presence released")
 
     # Case 5: geofence says left home — release identity immediately
-    if not location.home and location.zone != "home":
+    # Unknown is not evidence of absence. Only an explicit non-home zone may
+    # override the positive room signals above.
+    if location.zone not in {"home", "unknown", ""}:
         presence.detected = False
         presence.identity_sticky = False
         presence.sticky_since = None
         presence.source = "geofence_absent"
         presence.confidence = 0.0
         logger.info("Geofence says left home (%s) — identity released", location.zone)
+
+    if other_identity_detected and not ble_detected:
+        presence.detected = False
+        presence.identity_sticky = False
+        presence.sticky_since = None
+        presence.source = "other_identity"
+        presence.confidence = 0.0
 
     # --- Light decisions ---
     # Light on: presence detected (identity or sticky) and not sleep mode

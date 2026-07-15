@@ -4,9 +4,9 @@
 
 ## What It Does
 
-- **Presence fusion**: BLE (ESP32/ESPresense) + mmWave (HE20) + geofence (OwnTracks) → room-level presence with iPhone deep-sleep handling
+- **Presence fusion**: BLE (ESP32/ESPresense) + mmWave (HE20) + OwnTracks geofence → room-level presence with iPhone deep-sleep handling
 - **Tuya LAN control**: Direct control of RGBCW bulb + HE20 sensor via tinytuya — no cloud
-- **14 automations**: All ported from Home Assistant (adaptive light, sleep mode, alarm, work return, evening sleep, etc.)
+- **Room automations**: Adaptive light, sleep/alarm behavior, work-return settle/cancel, evening sleep, and daily resets
 - **World-awareness**: Marvi knows where you are, what mode the room is in, light state — as ambient context, not memory writes
 - **Marvi integration**: Plugin tools (`smart_room_state`, `smart_room_set_mode`, etc.) + session context line + subconscious transitions
 
@@ -15,7 +15,7 @@
 ```
 ESP32 (ESPresense) ──MQTT──┐
                            ├──→ Mosquitto MQTT ──→ Runtime (Python) ──→ Marvi Plugin
-OwnTracks (iPhone)  ──MQTT──┘                          ↑
+OwnTracks (iPhone) ──MQTT───┘
                                                   Tuya Controller (tinytuya)
                                                   (RGBCW bulb + HE20 sensor)
 ```
@@ -24,26 +24,14 @@ OwnTracks (iPhone)  ──MQTT──┘                          ↑
 
 ### 1. Install dependencies
 ```bash
-pip install tinytuya paho-mqtt pyyaml apscheduler
+pip install tinytuya paho-mqtt pyyaml
 ```
 
 ### 2. Install Mosquitto MQTT broker
 Download from https://mosquitto.org/download/ and install as Windows service.
 
-### 3. Link plugin into Marvi
-```bash
-# In the Marvi repo (D:\hermes-agent):
-mklink /D plugins\smart_room D:\smart-room-plugin
-# Or copy the directory:
-xcopy D:\smart-room-plugin D:\hermes-agent\plugins\smart_room\ /E /I
-```
-
-### 4. Enable in config.yaml
+### 3. Enable in config.yaml
 ```yaml
-plugins:
-  enabled:
-    - smart_room
-
 smart_room:
   enabled: true
   mqtt:
@@ -52,8 +40,20 @@ smart_room:
   # ... see NEEDS_YOU_AT_HOME.md for full config
 ```
 
-### 5. Hardware setup
-See **NEEDS_YOU_AT_HOME.md** for the full checklist (Tuya keys, ESP32 flash, OwnTracks setup).
+The plugin is bundled with Marvi; no symlink or second repository is needed.
+
+### 4. Hardware setup
+See **NEEDS_YOU_AT_HOME.md** for the remaining OwnTracks import and Home-region steps.
+
+To regenerate the password-bearing iPhone configuration without printing the
+password, run:
+
+```powershell
+python plugins/smart_room/scripts/create_owntracks_config.py `
+  --host <PC_TAILSCALE_IP> `
+  --env-file "$env:LOCALAPPDATA\hermes\.env" `
+  --output "$env:USERPROFILE\Downloads\marvi-owntracks.otrc"
+```
 
 ## Tools
 
@@ -68,7 +68,7 @@ See **NEEDS_YOU_AT_HOME.md** for the full checklist (Tuya keys, ESP32 flash, Own
 | `smart_room_diagnostic` | Full diagnostic dump |
 
 ## Spec
-See `D:\hermes-agent\docs\superpowers\specs\2026-07-14-marvi-smart-room-plugin-v0.3.md` for the full architecture spec.
+See `D:\hermes-agent\docs\superpowers\specs\2026-07-14-marvi-smart-room-plugin-v0.3.md` for the current v0.4 revision (the original path is retained for existing links).
 
 ## License
 MIT — xRetro Labs

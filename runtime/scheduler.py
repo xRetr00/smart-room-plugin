@@ -31,6 +31,7 @@ class Scheduler:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._alarm_active_since: Optional[float] = None
+        self._last_fired: Dict[str, str] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -58,27 +59,33 @@ class Scheduler:
         now = datetime.now()
         auto = self._config.get("automations", {})
 
+        def fire_once(name: str, configured_time: str, event: str) -> None:
+            try:
+                hour, minute = map(int, configured_time.split(":"))
+            except (AttributeError, TypeError, ValueError):
+                logger.warning("Ignoring invalid %s time: %r", name, configured_time)
+                return
+            key = now.strftime("%Y-%m-%d %H:%M")
+            if now.hour == hour and now.minute == minute and self._last_fired.get(name) != key:
+                self._last_fired[name] = key
+                self._emit(event, {"time": configured_time})
+
         # Daily alarm (default disabled — alarm_time must be explicitly set)
         alarm_time = auto.get("alarm", {}).get("daily_time")
         alarm_enabled = auto.get("alarm", {}).get("enabled", False)
         if alarm_enabled and alarm_time:
-            h, m = alarm_time.split(":")
-            if now.hour == int(h) and now.minute == int(m):
-                self._emit("schedule_alarm", {"time": alarm_time})
+            fire_once("alarm", alarm_time, "schedule_alarm")
 
         # Evening sleep
         evening_time = auto.get("evening_sleep", {}).get("time", "18:00")
         evening_enabled = auto.get("evening_sleep", {}).get("enabled", True)
         if evening_enabled:
-            h, m = evening_time.split(":")
-            if now.hour == int(h) and now.minute == int(m):
-                self._emit("schedule_evening_sleep", {"time": evening_time})
+            fire_once("evening_sleep", evening_time, "schedule_evening_sleep")
 
         # Daily reset at midnight
-        reset_time = auto.get("daily_reset", "00:00")
-        h, m = reset_time.split(":")
-        if now.hour == int(h) and now.minute == int(m):
-            self._emit("schedule_daily_reset", {})
+        reset_config = auto.get("daily_reset", "00:00")
+        reset_time = reset_config.get("time", "00:00") if isinstance(reset_config, dict) else reset_config
+        fire_once("daily_reset", reset_time, "schedule_daily_reset")
 
         # Alarm auto-clear
         alarm_duration = auto.get("alarm", {}).get("duration_minutes", 30)

@@ -28,11 +28,14 @@ from plugins.smart_room.bridge import call_runtime
 def check_smart_room_requirements() -> bool:
     """Return True when the smart_room plugin can run."""
     import platform as _p
-    if _p.system().lower() not in {"windows", "linux", "darwin"}:
+    if _p.system().lower() != "windows":
         return False
     try:
-        import paho.mqtt.client  # noqa: F401
-    except ImportError:
+        from plugins.smart_room.runtime.state_store import load_config
+
+        if not load_config().get("enabled", False):
+            return False
+    except Exception:
         return False
     return True
 
@@ -90,7 +93,7 @@ SMART_ROOM_SET_LIGHT_SCHEMA: Dict[str, Any] = {
             "on": {"type": "boolean", "description": "Turn the light on or off."},
             "brightness": {"type": "integer", "description": "Brightness 0-100.", "minimum": 0, "maximum": 100},
             "color_temp": {"type": "integer", "description": "Color temperature in Kelvin (2200=warm, 6500=cool).", "minimum": 2200, "maximum": 6500},
-            "rgb": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}, "description": "RGB color [R, G, B]."},
+            "rgb": {"type": "array", "items": {"type": "integer", "minimum": 0, "maximum": 255}, "minItems": 3, "maxItems": 3, "description": "RGB color [R, G, B]."},
         },
         "additionalProperties": False,
     },
@@ -142,7 +145,7 @@ def handle_smart_room_state(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("get_state", {}))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_set_mode(args: Dict[str, Any], **_kw) -> str:
@@ -152,7 +155,7 @@ def handle_smart_room_set_mode(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("set_mode", {"mode": mode}))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_set_light(args: Dict[str, Any], **_kw) -> str:
@@ -170,14 +173,14 @@ def handle_smart_room_set_light(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("set_light", params))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_cancel_sleep(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("cancel_sleep", {}))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_override(args: Dict[str, Any], **_kw) -> str:
@@ -185,18 +188,18 @@ def handle_smart_room_override(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("set_override", {"enabled": enabled}))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_health(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("get_health", {}))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_diagnostic(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("get_diagnostic", {}))
     except RuntimeError as e:
-        return _err(str(e), code="RUNTIME_UNAVAILABLE")
+        return _err(str(e), code="DEVICE_TIMEOUT")

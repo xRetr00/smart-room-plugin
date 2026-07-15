@@ -1,0 +1,8 @@
+{
+  "name": "smart_room",
+  "label": "Smart Room",
+  "description": "Authenticated Smart Room desktop API",
+  "version": "0.4.0",
+  "tab": {"hidden": true},
+  "api": "plugin_api.py"
+}
