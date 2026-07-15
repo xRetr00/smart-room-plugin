@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -22,6 +22,10 @@ class ModeBody(BaseModel):
 
 class OverrideBody(BaseModel):
     enabled: bool
+
+
+class WelcomeTestBody(BaseModel):
+    audience: Literal["owner", "guest"]
 
 
 class LightBody(BaseModel):
@@ -89,6 +93,11 @@ async def set_override(body: OverrideBody) -> dict:
 @router.post("/cancel-sleep")
 async def cancel_sleep() -> dict:
     return await _rpc("cancel_sleep", {})
+
+
+@router.post("/welcome/test")
+async def test_welcome(body: WelcomeTestBody) -> dict:
+    return await _rpc("test_welcome", {"audience": body.audience})
 
 
 @router.post("/apply")

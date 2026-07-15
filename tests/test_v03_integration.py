@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -132,6 +133,35 @@ def test_welcome_requires_one_hour_empty(monkeypatch):
     runtime._state.room_empty_since = (datetime.now(timezone.utc) - timedelta(hours=1, seconds=1)).isoformat()
     runtime._handle_welcome_transition(False, True)
     timer.start.assert_called_once()
+
+
+def test_welcome_preview_uses_voice_instant_without_recording_arrival(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+    import plugins.smart_room.runtime.app as app_module
+
+    calls = []
+    published = []
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.prompt_builder",
+        SimpleNamespace(load_soul_md=lambda: ""),
+    )
+    monkeypatch.setattr(
+        auxiliary_client,
+        "call_llm",
+        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Welcome home, Shereef."))]
+        ),
+    )
+    monkeypatch.setattr(app_module, "publish_welcome", published.append)
+    runtime = Runtime({"owner": "Shereef"})
+    runtime._state.last_welcome_at = None
+
+    runtime._publish_welcome(True, "Shereef", record_arrival=False)
+
+    assert calls[0]["task"] == "voice_instant"
+    assert published == ["Welcome home, Shereef."]
+    assert runtime._state.last_welcome_at is None
 
 
 def test_location_event_is_idempotent_and_schedules_work_return(monkeypatch):

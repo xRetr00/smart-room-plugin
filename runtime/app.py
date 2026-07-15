@@ -548,14 +548,34 @@ class Runtime:
                 return
             owner_detected = self._ble_detected
 
-        fallback = f"Welcome back, {self._owner_name}." if owner_detected else "Welcome."
+        self._publish_welcome(owner_detected, self._owner_name, record_arrival=True)
+
+    def test_welcome(self, audience: str) -> None:
+        """Generate a real welcome preview without changing arrival state."""
+        owner_detected = audience == "owner"
+        owner_name = str(load_config().get("owner", self._owner_name)).strip() or self._owner_name
+        thread = threading.Thread(
+            target=self._publish_welcome,
+            args=(owner_detected, owner_name),
+            kwargs={"record_arrival": False},
+            daemon=True,
+            name=f"smart_room_welcome_test_{audience}",
+        )
+        thread.start()
+
+    def _publish_welcome(
+        self, owner_detected: bool, owner_name: str, *, record_arrival: bool
+    ) -> None:
+        """Generate through auxiliary.voice_instant and publish to the TTS lane."""
+
+        fallback = f"Welcome back, {owner_name}." if owner_detected else "Welcome."
         try:
             from agent.auxiliary_client import call_llm
             from agent.message_content import flatten_message_text
             from agent.prompt_builder import load_soul_md
 
             identity = (
-                f"The detected person is the owner, named {self._owner_name}. Include that exact name."
+                f"The detected person is the owner, named {owner_name}. Include that exact name."
                 if owner_detected
                 else "The detected person is a guest whose name is unknown. Do not invent a name."
             )
@@ -580,17 +600,18 @@ class Runtime:
             greeting = " ".join(flatten_message_text(response.choices[0].message.content).split()).strip(' "')
             if not greeting:
                 greeting = fallback
-            if owner_detected and self._owner_name.casefold() not in greeting.casefold():
-                greeting = f"{self._owner_name}, {greeting[:1].lower()}{greeting[1:]}"
+            if owner_detected and owner_name.casefold() not in greeting.casefold():
+                greeting = f"{owner_name}, {greeting[:1].lower()}{greeting[1:]}"
             greeting = greeting[:300]
         except Exception:
             logger.warning("Could not generate room welcome; using fallback", exc_info=True)
             greeting = fallback
 
         publish_welcome(greeting)
-        with self._state_lock:
-            self._state.last_welcome_at = now_iso()
-            save_state(self._state)
+        if record_arrival:
+            with self._state_lock:
+                self._state.last_welcome_at = now_iso()
+                save_state(self._state)
 
     def _probe_wifi_presence(self) -> bool:
         config = (self._config.get("presence") or {}).get("wifi_ping") or {}

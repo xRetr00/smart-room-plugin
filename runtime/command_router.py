@@ -73,6 +73,13 @@ class CommandRouter:
         self._runtime.cancel_sleep()
         return {"success": True, "state": self._state.to_dict()}
 
+    def _handle_test_welcome(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        audience = str(params.get("audience", ""))
+        if audience not in {"owner", "guest"}:
+            return {"success": False, "error": "audience must be owner or guest"}
+        self._runtime.test_welcome(audience)
+        return {"success": True, "audience": audience}
+
     def _handle_set_override(self, params: Dict[str, Any]) -> Dict[str, Any]:
         enabled = bool(params.get("enabled", False))
         self._runtime.set_override(enabled)

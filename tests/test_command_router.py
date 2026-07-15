@@ -22,6 +22,7 @@ class TestCommandRouter:
         self.runtime.set_mode = MagicMock()
         self.runtime.set_light = MagicMock()
         self.runtime.cancel_sleep = MagicMock()
+        self.runtime.test_welcome = MagicMock()
         self.runtime.get_status = MagicMock(return_value={"running": True})
         self.router = CommandRouter(self.state, self.config, self.runtime)
 
@@ -51,6 +52,11 @@ class TestCommandRouter:
         result = self.router.dispatch("cancel_sleep", {})
         assert result["success"] is True
         self.runtime.cancel_sleep.assert_called_once()
+
+    def test_welcome_preview_calls_runtime_for_valid_audience(self):
+        result = self.router.dispatch("test_welcome", {"audience": "guest"})
+        assert result == {"success": True, "audience": "guest"}
+        self.runtime.test_welcome.assert_called_once_with("guest")
 
     def test_get_health_returns_report(self):
         result = self.router.dispatch("get_health", {})
