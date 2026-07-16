@@ -43,9 +43,14 @@ class TestAutomationEngine:
         assert light_action.params["color_temp"] == 6500
         assert light_action.params["flash"] is True
 
-    def test_alarm_duration_expired_sets_off_mode(self):
+    def test_alarm_duration_expired_restores_previous_state(self):
         actions = evaluate_automations(self.state, {"type": "alarm_duration_expired"}, self.config)
-        assert any(a.type == "set_mode" and a.params["mode"] == "off" for a in actions)
+        assert any(a.type == "ack_alarm" for a in actions)
+
+    def test_alarm_flash_becomes_steady(self):
+        actions = evaluate_automations(self.state, {"type": "alarm_flash_finished"}, self.config)
+        light = next(a for a in actions if a.type == "set_light")
+        assert light.params == {"on": True, "brightness": 100, "color_temp": 6500, "flash": False}
 
     def test_evening_sleep_triggers_sleep_mode(self):
         self.state.flags.evening_sleep_done_today = False
@@ -71,11 +76,11 @@ class TestAutomationEngine:
         assert flag_action.params["evening_sleep_done_today"] is False
 
     def test_automations_suppressed_in_sleep_mode(self):
-        self.state.modes.sleep = True
+        self.state.modes.active_mode = "sleep"
         actions = evaluate_automations(self.state, {"type": "presence_detected"}, self.config)
         assert not any(a.type == "turn_on" for a in actions)
 
     def test_automations_suppressed_with_manual_override(self):
-        self.state.modes.manual_override = True
+        self.state.modes.manual_override = "hold_off"
         actions = evaluate_automations(self.state, {"type": "presence_detected"}, self.config)
         assert not any(a.type == "turn_on" for a in actions)

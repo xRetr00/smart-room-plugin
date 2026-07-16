@@ -63,7 +63,7 @@ YAMNet confidence check remains the final decision.
 The plugin is bundled with Marvi; no symlink or second repository is needed.
 
 ### 4. Hardware setup
-See **NEEDS_YOU_AT_HOME.md** for the remaining OwnTracks import and Home-region steps.
+See **NEEDS_YOU_AT_HOME.md** for optional hardware calibration and soak checks.
 
 To regenerate the password-bearing iPhone configuration without printing the
 password, run:
@@ -80,12 +80,13 @@ python plugins/smart_room/scripts/create_owntracks_config.py `
 | Tool | Description |
 |------|-------------|
 | `smart_room_state` | Full room snapshot |
-| `smart_room_set_mode` | Set mode (reading/focus/relax/sleep/alarm/off) |
+| `smart_room_set_mode` | Set mode (reading/focus/relax/night/sleep/alarm/off) |
 | `smart_room_set_light` | Direct light control |
 | `smart_room_cancel_sleep` | Cancel sleep mode |
-| `smart_room_override` | Toggle manual override |
+| `smart_room_override` | Keep presence automation on, hold light on, or hold light off |
 | `smart_room_health` | Device health check |
 | `smart_room_diagnostic` | Full diagnostic dump |
+| `smart_room_alarm` | Create/update/list/delete one-day or daily alarms; acknowledge active alarm |
 
 ## Spec
 See `D:\hermes-agent\docs\superpowers\specs\2026-07-14-marvi-smart-room-plugin-v0.3.md` for the current v0.4 revision (the original path is retained for existing links).

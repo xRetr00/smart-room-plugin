@@ -210,16 +210,15 @@ def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -
         # Preserve the exact profile selected by the gateway in the child.
         env["MARVI_HOME"] = str(_root().parent)
         log_path = _root() / "runtime.log"
-        with open(log_path, "ab", buffering=0) as log_fh:
-            _process = subprocess.Popen(
-                [sys.executable, "-m", "plugins.smart_room.runtime.app"],
-                stdin=subprocess.DEVNULL,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                env=env,
-                start_new_session=True,
-                close_fds=True,
-            )
+        _process = subprocess.Popen(
+            [sys.executable, "-m", "plugins.smart_room.runtime.app"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
         record = {
             "pid": _process.pid,
             "started_at": time.time(),

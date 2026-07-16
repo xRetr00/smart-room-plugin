@@ -2,7 +2,7 @@
 
 Tools:
   smart_room_state         — full room snapshot (presence, light, modes, devices)
-  smart_room_set_mode      — set mode: reading, focus, relax, sleep, alarm, off
+  smart_room_set_mode      — set mode: reading, focus, relax, night, sleep, alarm, off
   smart_room_set_light     — direct light control (on/off, brightness, color)
   smart_room_cancel_sleep  — cancel sleep mode, restore previous state
   smart_room_override      — toggle manual override (disables presence automations)
@@ -62,7 +62,7 @@ SMART_ROOM_SET_MODE_SCHEMA: Dict[str, Any] = {
     "name": "smart_room_set_mode",
     "description": (
         "Set the smart room mode. Modes are mutually exclusive. "
-        "reading=warm 3000K 70%, focus=cool 5000K 100%, relax=warm amber 40%, "
+        "reading=warm 3000K 70%, focus=cool 5000K 100%, relax=warm amber 40%, night=dim warm 15%, "
         "sleep=lights off darkness enforced, alarm=flash bright white auto-expire, "
         "off=lights off no mode."
     ),
@@ -71,7 +71,7 @@ SMART_ROOM_SET_MODE_SCHEMA: Dict[str, Any] = {
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["reading", "focus", "relax", "sleep", "alarm", "off"],
+                "enum": ["reading", "focus", "relax", "night", "sleep", "alarm", "off"],
                 "description": "The mode to activate.",
             },
         },
@@ -107,11 +107,35 @@ SMART_ROOM_CANCEL_SLEEP_SCHEMA: Dict[str, Any] = {
 
 SMART_ROOM_OVERRIDE_SCHEMA: Dict[str, Any] = {
     "name": "smart_room_override",
-    "description": "Toggle manual override. When ON, presence-based automations are suppressed.",
+    "description": "Set presence automation override: none, hold_on prevents presence-clear turning the light off, hold_off prevents presence-entry turning it on.",
     "parameters": {
         "type": "object",
-        "properties": {"enabled": {"type": "boolean", "description": "True to enable override, false to disable."}},
-        "required": ["enabled"],
+        "properties": {"mode": {"type": "string", "enum": ["none", "hold_on", "hold_off"]}},
+        "required": ["mode"],
+        "additionalProperties": False,
+    },
+}
+
+SMART_ROOM_ALARM_SCHEMA: Dict[str, Any] = {
+    "name": "smart_room_alarm",
+    "description": (
+        "Create, update, list, delete, or acknowledge named Smart Room alarms. "
+        "Use acknowledge when the user says they are awake, asks to stop/dismiss the alarm, or presses the awake action. "
+        "Daily alarms need time; one-time alarms need time and date."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["list", "upsert", "delete", "acknowledge"]},
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "time": {"type": "string", "description": "Local time HH:MM"},
+            "recurrence": {"type": "string", "enum": ["once", "daily"]},
+            "date": {"type": "string", "description": "YYYY-MM-DD for one-time alarms"},
+            "enabled": {"type": "boolean"},
+            "duration_minutes": {"type": "integer", "minimum": 1, "maximum": 180},
+        },
+        "required": ["action"],
         "additionalProperties": False,
     },
 }
@@ -150,7 +174,7 @@ def handle_smart_room_state(args: Dict[str, Any], **_kw) -> str:
 
 def handle_smart_room_set_mode(args: Dict[str, Any], **_kw) -> str:
     mode = (args.get("mode") or "").strip().lower()
-    if mode not in {"reading", "focus", "relax", "sleep", "alarm", "off"}:
+    if mode not in {"reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
         return _err(f"invalid mode: {mode!r}")
     try:
         return _json(call_runtime("set_mode", {"mode": mode}))
@@ -184,9 +208,11 @@ def handle_smart_room_cancel_sleep(args: Dict[str, Any], **_kw) -> str:
 
 
 def handle_smart_room_override(args: Dict[str, Any], **_kw) -> str:
-    enabled = bool(args.get("enabled"))
+    mode = str(args.get("mode") or "none")
+    if mode not in {"none", "hold_on", "hold_off"}:
+        return _err("override mode must be none, hold_on, or hold_off")
     try:
-        return _json(call_runtime("set_override", {"enabled": enabled}))
+        return _json(call_runtime("set_override", {"mode": mode}))
     except RuntimeError as e:
         return _err(str(e), code="DEVICE_TIMEOUT")
 
@@ -201,5 +227,22 @@ def handle_smart_room_health(args: Dict[str, Any], **_kw) -> str:
 def handle_smart_room_diagnostic(args: Dict[str, Any], **_kw) -> str:
     try:
         return _json(call_runtime("get_diagnostic", {}))
+    except RuntimeError as e:
+        return _err(str(e), code="DEVICE_TIMEOUT")
+
+
+def handle_smart_room_alarm(args: Dict[str, Any], **_kw) -> str:
+    action = str(args.get("action") or "")
+    method = {
+        "list": "list_alarms",
+        "upsert": "upsert_alarm",
+        "delete": "delete_alarm",
+        "acknowledge": "acknowledge_alarm",
+    }.get(action)
+    if not method:
+        return _err("invalid alarm action")
+    params = {key: value for key, value in args.items() if key != "action"}
+    try:
+        return _json(call_runtime(method, params))
     except RuntimeError as e:
         return _err(str(e), code="DEVICE_TIMEOUT")

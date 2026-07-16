@@ -21,7 +21,17 @@ class ModeBody(BaseModel):
 
 
 class OverrideBody(BaseModel):
-    enabled: bool
+    mode: Literal["none", "hold_on", "hold_off"]
+
+
+class AlarmBody(BaseModel):
+    id: Optional[str] = None
+    name: str = Field(min_length=1, max_length=80)
+    time: str
+    recurrence: Literal["once", "daily"]
+    date: Optional[str] = None
+    enabled: bool = True
+    duration_minutes: int = Field(default=30, ge=1, le=180)
 
 
 class WelcomeTestBody(BaseModel):
@@ -70,7 +80,7 @@ async def get_status() -> dict:
 
 @router.post("/mode")
 async def set_mode(body: ModeBody) -> dict:
-    if body.mode not in {"reading", "focus", "relax", "sleep", "alarm", "off"}:
+    if body.mode not in {"reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
         raise HTTPException(status_code=400, detail="invalid mode")
     return await _rpc("set_mode", {"mode": body.mode})
 
@@ -87,7 +97,7 @@ async def set_light(body: LightBody) -> dict:
 
 @router.post("/override")
 async def set_override(body: OverrideBody) -> dict:
-    return await _rpc("set_override", {"enabled": body.enabled})
+    return await _rpc("set_override", {"mode": body.mode})
 
 
 @router.post("/cancel-sleep")
@@ -98,6 +108,26 @@ async def cancel_sleep() -> dict:
 @router.post("/welcome/test")
 async def test_welcome(body: WelcomeTestBody) -> dict:
     return await _rpc("test_welcome", {"audience": body.audience})
+
+
+@router.get("/alarms")
+async def list_alarms() -> dict:
+    return await _rpc("list_alarms", {})
+
+
+@router.put("/alarms")
+async def upsert_alarm(body: AlarmBody) -> dict:
+    return await _rpc("upsert_alarm", body.model_dump(exclude_none=True))
+
+
+@router.delete("/alarms/{alarm_id}")
+async def delete_alarm(alarm_id: str) -> dict:
+    return await _rpc("delete_alarm", {"id": alarm_id})
+
+
+@router.post("/alarms/acknowledge")
+async def acknowledge_alarm() -> dict:
+    return await _rpc("acknowledge_alarm", {"reason": "desktop"})
 
 
 @router.post("/apply")

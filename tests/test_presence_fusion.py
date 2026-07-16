@@ -77,7 +77,7 @@ class TestFusionAxioms:
         p = Presence(detected=False)
         mm = MmWaveState(occupied=False)
         loc = PhoneLocation()
-        p, mm, loc, _, _ = fuse(
+        p, mm, loc, light_on, _ = fuse(
             p, mm, loc, ble_detected=False, ble_rssi=None,
             mmwave_occupied=True, geofence_zone=None, exit_timeout_elapsed=False
         )
@@ -85,6 +85,7 @@ class TestFusionAxioms:
         assert p.detected is False
         assert p.source == "mmwave_only"
         assert p.confidence == 0.0
+        assert light_on is True
 
     def test_axiom5b_mmwave_alone_with_geofence_home_can_upgrade(self):
         """mmWave + geofence home → identity can be established (geofence is identity signal)."""
@@ -122,6 +123,32 @@ class TestStickyDecay:
         past_30s = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
         c2 = _decay_confidence(past_30s, now)
         assert c2 < c1
+
+    def test_four_hour_sleeping_phone_soak_holds_identity_and_light(self):
+        """Four hours of BLE silence cannot darken an mmWave-occupied room."""
+        sticky_since = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        p = Presence(
+            detected=True,
+            confidence=0.6,
+            source="ble_sticky_mmwave",
+            identity_sticky=True,
+            sticky_since=sticky_since,
+            last_seen=sticky_since,
+        )
+        p, _, _, light_on, light_off = fuse(
+            p,
+            MmWaveState(occupied=True, last_seen=now_iso()),
+            PhoneLocation(),
+            ble_detected=False,
+            ble_rssi=None,
+            mmwave_occupied=True,
+            geofence_zone=None,
+            exit_timeout_elapsed=False,
+        )
+        assert p.detected is True
+        assert p.confidence == 0.6
+        assert light_on is True
+        assert light_off is False
 
 
 class TestGeofenceRelease:

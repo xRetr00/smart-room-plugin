@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import threading
 from pathlib import Path
 from typing import Any, Dict
@@ -25,16 +26,25 @@ def state_path() -> Path:
 
 
 def load_state() -> RoomState:
-    """Load state from disk, or return fresh default."""
+    """Load state, recovering the previous atomic snapshot when necessary."""
     p = state_path()
     if not p.is_file():
         return RoomState()
+    backup = p.with_suffix(".json.bak")
+    for candidate in (p, backup):
+        try:
+            state = RoomState.from_dict(json.loads(candidate.read_text(encoding="utf-8")))
+            if candidate == backup:
+                shutil.copy2(backup, p)
+                logger.error("Recovered corrupt Smart Room state from %s", backup)
+            return state
+        except Exception as exc:
+            logger.warning("Failed to load state from %s: %s", candidate, exc)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return RoomState.from_dict(data)
-    except Exception as e:
-        logger.warning("Failed to load state from %s: %s — using fresh state", p, e)
-        return RoomState()
+        p.replace(p.with_suffix(".json.corrupt"))
+    except OSError:
+        pass
+    return RoomState()
 
 
 def save_state(state: RoomState) -> None:
@@ -42,8 +52,11 @@ def save_state(state: RoomState) -> None:
     p = state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
+    backup = p.with_suffix(".json.bak")
     data = state.to_dict()
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    if p.is_file():
+        shutil.copy2(p, backup)
     tmp.replace(p)
     logger.debug("State saved (event_id=%d)", state.event_id)
 
@@ -104,6 +117,22 @@ def publish_welcome(message: str) -> None:
         )
     except Exception:
         logger.debug("Failed to publish smart-room welcome", exc_info=True)
+
+
+def publish_alarm(alarm_id: str, message: str, *, active: bool) -> None:
+    """Surface alarm speech/session lifecycle through Desktop's proactive lane."""
+    try:
+        from cron.scheduler import record_subconscious_activity
+
+        record_subconscious_activity(
+            source="smart_room_alarm",
+            job_id=alarm_id,
+            outcome="message" if active else "diff_silent",
+            summary="Smart Room alarm" if active else "Alarm acknowledged",
+            thought=message if active else None,
+        )
+    except Exception:
+        logger.debug("Failed to publish smart-room alarm", exc_info=True)
 
 
 def load_transition_events(after_id: int = 0) -> list[Dict[str, Any]]:

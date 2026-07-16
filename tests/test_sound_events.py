@@ -65,5 +65,5 @@ def test_sound_actions_use_room_state_and_tuya_status() -> None:
     assert runtime._tuya.commands[-1]["on"] is False
 
     runtime._on_sound_action("sleep")
-    assert runtime._state.modes.sleep is True
+    assert runtime._state.modes.active_mode == "sleep"
     assert runtime._tuya.commands[-1]["on"] is False

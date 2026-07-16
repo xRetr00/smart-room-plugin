@@ -18,6 +18,7 @@ def _client(owner_device_id: str = "irk:iphone") -> tuple[MQTTClient, MagicMock,
                 "owner_device_id": owner_device_id,
                 "rssi_enter_threshold": -70,
                 "rssi_exit_threshold": -85,
+                "enter_debounce_seconds": 0,
             }
         },
         on_presence=presence,

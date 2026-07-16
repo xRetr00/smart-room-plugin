@@ -22,10 +22,11 @@ Use smart_room tools when the user asks about:
 | Tool | What it does |
 |------|-------------|
 | `smart_room_state` | Full room snapshot — presence, light, modes, devices, location |
-| `smart_room_set_mode` | Set mode: reading, focus, relax, sleep, alarm, off |
+| `smart_room_set_mode` | Set mode: reading, focus, relax, night, sleep, alarm, off |
 | `smart_room_set_light` | Direct light control — on/off, brightness, color temp, RGB |
 | `smart_room_cancel_sleep` | Cancel sleep mode and restore previous state |
-| `smart_room_override` | Toggle manual override (disables presence-based automations) |
+| `smart_room_override` | Automatic presence, hold light on, or hold light off |
+| `smart_room_alarm` | Manage named one-day/daily alarms and acknowledge wake-up |
 | `smart_room_health` | Device health check — online/offline status, last seen |
 | `smart_room_diagnostic` | Full diagnostic dump for troubleshooting |
 

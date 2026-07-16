@@ -156,8 +156,9 @@ def fuse(
         presence.confidence = 0.0
 
     # --- Light decisions ---
-    # Light on: presence detected (identity or sticky) and not sleep mode
-    light_should_on = presence.detected and presence.confidence > 0
+    # Occupancy controls the room, identity only personalizes it. A guest (or
+    # an owner whose phone is unavailable) must still get safe automatic light.
+    light_should_on = mmwave_occupied or (presence.detected and presence.confidence > 0)
 
     # Light off: mmWave clear for timeout AND BLE absent
     light_should_off = (not mmwave_occupied and not ble_detected and exit_timeout_elapsed)

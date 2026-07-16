@@ -53,6 +53,7 @@ class MQTTClient:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._active_identities: set[str] = set()
+        self._entry_seen_at: Dict[str, float] = {}
 
         mqtt_cfg = config.get("mqtt", {})
         self._broker = mqtt_cfg.get("broker", "127.0.0.1")
@@ -90,6 +91,8 @@ class MQTTClient:
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         self._client.on_disconnect = self._on_disconnect
+        if hasattr(self._client, "reconnect_delay_set"):
+            self._client.reconnect_delay_set(min_delay=1, max_delay=30)
 
         # Start in background thread
         self._stop.clear()
@@ -109,16 +112,17 @@ class MQTTClient:
 
     def _connect_loop(self) -> None:
         """Connect and reconnect loop."""
+        delay = 1
         while not self._stop.is_set():
             try:
                 self._client.connect(self._broker, self._port, 60)
                 self._client.loop_start()
-                # Wait for stop or disconnect
-                while not self._stop.is_set():
-                    time.sleep(1)
+                self._stop.wait()
+                return
             except Exception as e:
-                logger.warning("MQTT connect failed: %s — retrying in 5s", e)
-                self._stop.wait(5)
+                logger.warning("MQTT connect failed: %s — retrying in %ss", e, delay)
+                self._stop.wait(delay)
+                delay = min(30, delay * 2)
 
     def _on_connect(self, client, userdata, flags, rc) -> None:
         if rc == 0:
@@ -209,10 +213,18 @@ class MQTTClient:
         threshold = self._config.get("esp32", {}).get("rssi_enter_threshold", -70)
         exit_threshold = self._config.get("esp32", {}).get("rssi_exit_threshold", -85)
         was_active = identity in self._active_identities
-        if rssi is not None and (rssi > threshold or (was_active and rssi > exit_threshold)):
+        strong = rssi > threshold or (was_active and rssi > exit_threshold)
+        if strong and not was_active:
+            first = self._entry_seen_at.setdefault(identity, time.monotonic())
+            debounce = max(0, float(self._config.get("esp32", {}).get("enter_debounce_seconds", 3)))
+            if time.monotonic() - first < debounce:
+                return
+        if strong:
             self._active_identities.add(identity)
+            self._entry_seen_at.pop(identity, None)
             self._on_presence(True, rssi, identity)
         else:
+            self._entry_seen_at.pop(identity, None)
             self._active_identities.discard(identity)
             self._on_presence(False, rssi, identity)
 

@@ -13,29 +13,18 @@
 - Python dependencies and discovery scripts verified.
 - OwnTracks installed on the iPhone.
 - Complete OwnTracks configuration generated at `C:\Users\xRetro\Downloads\marvi-owntracks.otrc` and sent to the iPhone with Taildrop.
+- OwnTracks configuration imported, Home region created, and real Home/Bakery transitions received by Marvi.
 - HE20 false-clear handling fixed: light-off waits for 60 seconds of continuous clear and is emitted once.
 - Desktop Smart Room scrolling, switches, and separate owner/HE20 status verified in the packaged app.
 
-## What you still need to do
+## What is still useful to measure
 
-### 1. Import the OwnTracks configuration on iPhone
+No setup step is blocking normal use. The remaining work is calibration and soak testing:
 
-OwnTracks 26.2.3 disables external configuration files by default as a security precaution.
-
-1. Open OwnTracks → Settings and enable external configuration-file loading.
-2. Open the Taildrop file `marvi-owntracks.otrc` from the iPhone Files app and choose OwnTracks.
-3. Review the configuration diff and approve the import.
-4. The imported values should show MQTT mode, host `100.118.1.55`, port `1883`, User ID `smart_room`, Device ID `iphone`, TLS off, and authentication on.
-
-The private Tailscale tunnel provides transport encryption, so TLS is intentionally off at the local Mosquitto endpoint. Port 1883 is not exposed publicly.
-
-### 2. Grant location permissions and add Home
-
-1. Give OwnTracks **Always** location permission, Precise Location, Background App Refresh, and motion access when requested.
-2. In OwnTracks Regions, create a circular region named exactly `home` around the house (about 150–200 m radius).
-3. Use Significant monitoring mode for normal battery-friendly operation.
-4. Publish the current location once.
-5. Tell Marvi that the OwnTracks import is complete so the MQTT location and region transition can be verified live.
+- Measure locked-iPhone BLE gaps for 60 minutes at desk, bed, door, and outside the room.
+- Run a real four-hour overnight presence test.
+- Confirm OwnTracks background transitions on Wi-Fi and through Tailscale cellular access.
+- Run the HE20 continuously for one hour and the complete room for seven days.
 
 Shortcuts is cancelled. OwnTracks is the only phone geofence path.
 

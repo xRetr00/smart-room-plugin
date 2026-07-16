@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from contextlib import nullcontext
 from typing import Any, Dict
 
 from plugins.smart_room.runtime.models import RoomState
@@ -36,42 +35,58 @@ class CommandRouter:
         self._config = config
         self._runtime = runtime
 
-    def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def dispatch(self, method: str, params: Dict[str, Any], request_id: str = "") -> Dict[str, Any]:
         """Route an RPC method to the handler."""
         handler = getattr(self, f"_handle_{method}", None)
         if handler is None:
-            return {"success": False, "error": f"unknown method: {method}"}
+            result = {"success": False, "error": f"unknown method: {method}"}
+            return self._ack(result, request_id)
         try:
             if method == "ping":
-                return handler(params)
-            lock = getattr(self._runtime, "_state_lock", None)
-            with lock if lock is not None else nullcontext():
-                return handler(params)
+                return self._ack(handler(params), request_id)
+            return self._ack(handler(params), request_id)
         except Exception as e:
             logger.error("Command %s failed: %s", method, e)
-            return {"success": False, "error": str(e)}
+            return self._ack({"success": False, "error": str(e)}, request_id)
+
+    @staticmethod
+    def _ack(result: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "request_id": request_id,
+            "status": "success" if result.get("success") else "failed",
+            **result,
+        }
 
     def _handle_get_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        return {"success": True, "state": self._state.to_dict()}
+        return {"success": True, "state": self._state_dict()}
+
+    def _state_dict(self) -> Dict[str, Any]:
+        lock = getattr(self._runtime, "_state_lock", None)
+        if lock is None:
+            return self._state.to_dict()
+        with lock:
+            return self._state.to_dict()
 
     def _handle_ping(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return {"success": True}
 
     def _handle_set_mode(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mode = params.get("mode", "off")
-        if mode not in {"reading", "focus", "relax", "sleep", "alarm", "off"}:
+        if mode not in {"reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
             return {"success": False, "error": f"invalid mode: {mode}"}
         self._runtime.set_mode(mode)
-        return {"success": True, "mode": mode, "state": self._state.to_dict()}
+        return {"success": True, "mode": mode, "state": self._state_dict()}
 
     def _handle_set_light(self, params: Dict[str, Any]) -> Dict[str, Any]:
         result = self._runtime.set_light(**params, manual=True)
         ack = result if isinstance(result, dict) else {"success": True}
-        return {**ack, "light": self._state.light.__dict__, "state": self._state.to_dict()}
+        state = self._state_dict()
+        return {**ack, "light": state["light"], "state": state}
 
     def _handle_cancel_sleep(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._runtime.cancel_sleep()
-        return {"success": True, "state": self._state.to_dict()}
+        return {"success": True, "state": self._state_dict()}
 
     def _handle_test_welcome(self, params: Dict[str, Any]) -> Dict[str, Any]:
         audience = str(params.get("audience", ""))
@@ -81,10 +96,26 @@ class CommandRouter:
         return {"success": True, "audience": audience}
 
     def _handle_set_override(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        enabled = bool(params.get("enabled", False))
-        self._runtime.set_override(enabled)
-        logger.info("Manual override %s", "enabled" if enabled else "disabled")
-        return {"success": True, "override": enabled, "state": self._state.to_dict()}
+        mode = str(params.get("mode") or ("hold_on" if params.get("enabled") else "none"))
+        self._runtime.set_override(mode)
+        return {"success": True, "override": mode, "state": self._state_dict()}
+
+    def _handle_list_alarms(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "alarms": self._runtime.list_alarms(),
+            "active_alarm": self._runtime.get_active_alarm(),
+        }
+
+    def _handle_upsert_alarm(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return {"success": True, "alarm": self._runtime.upsert_alarm(params)}
+
+    def _handle_delete_alarm(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        alarm_id = str(params.get("id") or "")
+        return {"success": self._runtime.delete_alarm(alarm_id), "id": alarm_id}
+
+    def _handle_acknowledge_alarm(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.acknowledge_alarm(reason=str(params.get("reason") or "awake"))
 
     def _handle_get_health(self, params: Dict[str, Any]) -> Dict[str, Any]:
         health = check_device_health(self._state, self._config)
@@ -111,12 +142,4 @@ class CommandRouter:
         return {"success": True}
 
     def _handle_get_diagnostic(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "success": True,
-            "diagnostic": {
-                "state": self._state.to_dict(),
-                "config": _redact_config(self._config),
-                "health": check_device_health(self._state, self._config),
-                "runtime": self._runtime.get_status(),
-            },
-        }
+        return {"success": True, "diagnostic": self._runtime.run_diagnostic()}

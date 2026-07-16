@@ -224,6 +224,38 @@ def test_scheduler_fires_each_daily_trigger_once(monkeypatch):
     assert [event for event, _ in emitted] == ["schedule_evening_sleep"]
 
 
+def test_scheduler_supports_one_day_and_daily_named_alarms(monkeypatch):
+    import plugins.smart_room.runtime.scheduler as scheduler_module
+
+    fixed = datetime(2026, 7, 15, 8, 0)
+
+    class FakeDateTime:
+        @classmethod
+        def now(cls, *_args):
+            return fixed
+
+        @classmethod
+        def fromisoformat(cls, value):
+            return datetime.fromisoformat(value)
+
+    alarms = [
+        {"id": "once", "name": "Once", "time": "08:00", "recurrence": "once", "date": "2026-07-15", "enabled": True},
+        {"id": "daily", "name": "Daily", "time": "08:00", "recurrence": "daily", "enabled": True},
+    ]
+    monkeypatch.setattr(scheduler_module, "datetime", FakeDateTime)
+    emitted = []
+    scheduler = Scheduler(
+        {"automations": {"evening_sleep": {"enabled": False}}},
+        lambda event, data: emitted.append((event, data)),
+        get_alarms=lambda: alarms,
+    )
+
+    scheduler._check_triggers()
+    scheduler._check_triggers()
+
+    assert [data["alarm"]["id"] for event, data in emitted if event == "schedule_alarm"] == ["once", "daily"]
+
+
 def test_plugin_registers_tools_lifecycle_and_context(monkeypatch):
     import plugins.smart_room as plugin
 
@@ -245,7 +277,7 @@ def test_plugin_registers_tools_lifecycle_and_context(monkeypatch):
     monkeypatch.setattr(plugin.platform, "system", lambda: "Windows")
     ctx = FakeContext()
     plugin.register(ctx)
-    assert len(ctx.tools) == 7
+    assert len(ctx.tools) == 8
     assert {name for name, _ in ctx.hooks} == {
         "on_gateway_start", "on_gateway_stop",
     }
@@ -276,7 +308,7 @@ def test_context_line_is_config_gated_and_uses_fused_source():
     state.light.on = True
     state.light.brightness = 70
     state.light.scene = "reading"
-    state.modes.reading = True
+    state.modes.active_mode = "reading"
     save_state(state)
     line = build_context_line()
     assert line is not None

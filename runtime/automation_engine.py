@@ -50,20 +50,17 @@ def evaluate_automations(
     auto_cfg = config.get("automations", {})
 
     # Don't run presence-based automations in sleep/alarm mode or with override
-    suppress = (
-        state.modes.sleep or
-        state.modes.alarm or
-        state.modes.manual_override
-    )
+    suppress_on = state.modes.active_mode in {"sleep", "alarm"} or state.modes.manual_override == "hold_off"
+    suppress_off = state.modes.active_mode in {"sleep", "alarm"} or state.modes.manual_override == "hold_on"
 
     # --- 4.1 Adaptive Light On ---
     if auto_cfg.get("adaptive_light", {}).get("enabled", True):
-        if event_type == "presence_detected" and not suppress:
+        if event_type == "presence_detected" and not suppress_on:
             actions.append(Action(type="turn_on", params={"restore_scene": True}))
 
     # --- 4.2 Light Off After Clear ---
     if auto_cfg.get("adaptive_light", {}).get("enabled", True):
-        if event_type == "presence_cleared" and not suppress:
+        if event_type == "presence_cleared" and not suppress_off:
             actions.append(Action(type="turn_off", params={}))
 
     # --- 4.3 Sleep Mode Enforce Darkness ---
@@ -83,10 +80,22 @@ def evaluate_automations(
 
     # --- 4.6 Clear Alarm After Duration ---
     if event_type == "schedule_alarm":
-        actions.append(Action(type="set_mode", params={"mode": "alarm", "reason": "schedule"}))
+        alarm = event.get("alarm") or {}
+        actions.append(Action(type="set_mode", params={
+            "mode": "alarm",
+            "reason": "schedule",
+            "alarm_id": alarm.get("id"),
+            "alarm_name": alarm.get("name"),
+            "duration_minutes": alarm.get("duration_minutes", 30),
+        }))
+
+    if event_type == "alarm_flash_finished":
+        actions.append(Action(type="set_light", params={
+            "on": True, "brightness": 100, "color_temp": 6500, "flash": False,
+        }))
 
     if event_type == "alarm_duration_expired":
-        actions.append(Action(type="set_mode", params={"mode": "off"}))
+        actions.append(Action(type="ack_alarm", params={"reason": "expired"}))
 
     # --- 4.7 Work Return Sleep ---
     work_cfg = auto_cfg.get("work_return", {})

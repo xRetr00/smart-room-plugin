@@ -53,6 +53,21 @@ def test_welcome_preview_calls_private_runtime_bridge(monkeypatch):
     assert calls == [("test_welcome", {"audience": "owner"})]
 
 
+def test_named_alarm_crud_calls_runtime(monkeypatch):
+    calls = []
+    monkeypatch.setattr(plugin_api, "call_runtime", lambda method, params: calls.append((method, params)) or {"success": True})
+    client = _client()
+    body = {
+        "id": "wake", "name": "Work", "time": "08:00", "recurrence": "daily",
+        "enabled": True, "duration_minutes": 30,
+    }
+
+    assert client.put("/api/plugins/smart_room/alarms", json=body).status_code == 200
+    assert client.delete("/api/plugins/smart_room/alarms/wake").status_code == 200
+    assert client.post("/api/plugins/smart_room/alarms/acknowledge").status_code == 200
+    assert [method for method, _ in calls] == ["upsert_alarm", "delete_alarm", "acknowledge_alarm"]
+
+
 def test_secret_fields_are_written_to_env_store(monkeypatch):
     saved = []
     monkeypatch.setattr(plugin_api, "save_env_value", lambda key, value: saved.append((key, value)))

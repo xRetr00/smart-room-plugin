@@ -26,7 +26,7 @@ from hermes_constants import get_hermes_home
 # For simplicity and cross-platform support, we use a localhost TCP socket.
 
 _DEFAULT_PORT = 17842  # smart_room runtime RPC port
-_TIMEOUT_SECONDS = 2.0  # bounded wait for runtime responses
+_TIMEOUT_SECONDS = 8.0  # includes bounded scene fades and device retries
 
 
 def _state_file() -> Path:
@@ -170,12 +170,12 @@ def build_context_line() -> Optional[str]:
 
     # Mode
     modes = state.get("modes", {})
-    active_mode = next(
-        (m for m, v in modes.items() if v and m not in ("manual_override", "work_return")),
-        None
-    )
+    active_mode = modes.get("active_mode")
     if active_mode:
         parts.append(f"mode: {active_mode}")
+    active_alarm = state.get("active_alarm")
+    if isinstance(active_alarm, dict):
+        parts.append(f"active alarm: {active_alarm.get('name', 'Alarm')} ({active_alarm.get('phase', 'active')})")
 
     if not parts:
         return None

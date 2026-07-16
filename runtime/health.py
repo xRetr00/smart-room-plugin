@@ -51,6 +51,11 @@ def check_device_health(state: RoomState, config: Dict[str, Any]) -> Dict[str, A
             "ip": dev.ip,
             "last_seen": dev.last_seen,
             "last_poll": dev.last_poll,
+            "consecutive_failures": dev.consecutive_failures,
+            "last_success": dev.last_success,
+            "last_command": dev.last_command,
+            "queue_depth": dev.queue_depth,
+            "circuit_open": dev.circuit_open,
         }
 
     # ESP32 staleness check

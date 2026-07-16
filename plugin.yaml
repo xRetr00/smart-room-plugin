@@ -1,5 +1,5 @@
 name: smart_room
-version: 0.5.0
+version: 0.6.0
 description: "Smart room engine for Marvi — presence fusion, Tuya LAN control, automations, YAMNet clap controls, and world-awareness context. Native Windows, no Docker/WSL."
 author: xRetro Labs
 kind: backend
@@ -16,6 +16,7 @@ provides_tools:
   - smart_room_override
   - smart_room_health
   - smart_room_diagnostic
+  - smart_room_alarm
 hooks:
   - on_gateway_start
   - on_gateway_stop
