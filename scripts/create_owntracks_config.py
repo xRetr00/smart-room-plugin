@@ -53,7 +53,15 @@ def main() -> int:
     parser.add_argument(
         "--env-file",
         type=Path,
-        default=Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / ".env",
+        default=Path(
+            os.environ.get(
+                "MARVI_SMART_ROOM_HOME",
+                Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+                / "Marvi-OS"
+                / "plugin-data"
+                / "smart_room",
+            )
+        ) / "secrets.env",
     )
     args = parser.parse_args()
     password = _read_env(args.env_file).get("SMART_ROOM_MQTT_PASSWORD", "")

@@ -29,10 +29,16 @@ class TestCommandRouter:
         self.runtime.upsert_alarm = MagicMock(return_value={"id": "wake", "name": "Work"})
         self.runtime.delete_alarm = MagicMock(return_value=True)
         self.runtime.acknowledge_alarm = MagicMock(return_value={"success": True, "active": False})
+        self.runtime.vision_observe = MagicMock(return_value={"success": True, "vision": {}})
+        self.runtime.vision_describe = MagicMock(return_value={"success": True, "description": "owner visible"})
+        self.runtime.vision_people = MagicMock(return_value={"success": True, "people": []})
+        self.runtime.vision_visitors = MagicMock(return_value={"success": True, "visitors": []})
+        self.runtime.vision_enroll_owner = MagicMock(return_value={"success": True, "name": "Retro"})
+        self.runtime.vision_approve = MagicMock(return_value={"success": True, "name": "Guest"})
+        self.runtime.vision_reject = MagicMock(return_value={"success": True, "sighting_id": 7})
         self.runtime.get_status = MagicMock(
             return_value={
                 "running": True,
-                "sound_events": {"enabled": True, "running": True},
             }
         )
         self.router = CommandRouter(self.state, self.config, self.runtime)
@@ -47,7 +53,7 @@ class TestCommandRouter:
     def test_set_mode_calls_runtime(self):
         result = self.router.dispatch("set_mode", {"mode": "reading"})
         assert result["success"] is True
-        self.runtime.set_mode.assert_called_once_with("reading")
+        self.runtime.set_mode.assert_called_once_with("reading", reason="manual")
 
     def test_set_light_calls_runtime(self):
         result = self.router.dispatch("set_light", {"on": True, "brightness": 50})
@@ -75,7 +81,7 @@ class TestCommandRouter:
         result = self.router.dispatch("get_health", {})
         assert result["success"] is True
         assert "health" in result
-        assert result["health"]["sound_events"]["running"] is True
+        assert "mqtt" in result["health"]
 
     def test_get_diagnostic_returns_full_dump(self):
         result = self.router.dispatch("get_diagnostic", {})
@@ -94,3 +100,21 @@ class TestCommandRouter:
         assert created["request_id"] == "cmd-1"
         acknowledged = self.router.dispatch("acknowledge_alarm", {})
         assert acknowledged["active"] is False
+
+    def test_vision_reads_route_to_the_sidecar_worker(self):
+        assert self.router.dispatch("vision_observe", {})["success"] is True
+        assert self.router.dispatch("vision_describe", {})["description"] == "owner visible"
+        assert self.router.dispatch("vision_people", {})["people"] == []
+        assert self.router.dispatch("vision_visitors", {})["visitors"] == []
+
+    def test_vision_identity_changes_route_to_the_sidecar_worker(self):
+        enrolled = self.router.dispatch("vision_enroll_owner", {"name": "Retro", "seconds": 3})
+        approved = self.router.dispatch(
+            "vision_approve", {"sighting_id": 7, "name": "Guest", "owner": False}
+        )
+        rejected = self.router.dispatch("vision_reject", {"sighting_id": 7})
+
+        assert enrolled["name"] == "Retro"
+        self.runtime.vision_enroll_owner.assert_called_once_with("Retro", 3.0)
+        assert approved["name"] == "Guest"
+        assert rejected["sighting_id"] == 7

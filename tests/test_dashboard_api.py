@@ -70,7 +70,11 @@ def test_named_alarm_crud_calls_runtime(monkeypatch):
 
 def test_secret_fields_are_written_to_env_store(monkeypatch):
     saved = []
-    monkeypatch.setattr(plugin_api, "save_env_value", lambda key, value: saved.append((key, value)))
+    monkeypatch.setattr(
+        plugin_api,
+        "set_key",
+        lambda path, key, value, quote_mode: saved.append((key, value)),
+    )
     response = _client().put(
         "/api/plugins/smart_room/secrets",
         json={"bulb_key": "bulb-secret", "mqtt_password": "mqtt-secret"},

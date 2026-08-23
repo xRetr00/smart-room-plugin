@@ -15,7 +15,7 @@ class TestAutomationEngine:
         self.state = RoomState()
         self.config = {
             "automations": {
-                "adaptive_light": {"enabled": True},
+                "adaptive_light": {"enabled": True, "auto_off": True},
                 "alarm": {"enabled": True, "flash_interval_ms": 500, "duration_minutes": 30},
                 "evening_sleep": {"enabled": True, "time": "18:00"},
                 "work_return": {"enabled": True, "settle_delay": 300},
@@ -30,6 +30,16 @@ class TestAutomationEngine:
     def test_presence_cleared_triggers_light_off(self):
         actions = evaluate_automations(self.state, {"type": "presence_cleared"}, self.config)
         assert any(a.type == "turn_off" for a in actions)
+
+    def test_presence_clear_does_not_turn_off_without_explicit_opt_in(self):
+        self.config["automations"]["adaptive_light"]["auto_off"] = False
+        actions = evaluate_automations(self.state, {"type": "presence_cleared"}, self.config)
+        assert not any(a.type == "turn_off" for a in actions)
+
+    def test_focus_mode_keeps_light_on_when_presence_clears(self):
+        self.state.modes.active_mode = "focus"
+        actions = evaluate_automations(self.state, {"type": "presence_cleared"}, self.config)
+        assert not any(a.type == "turn_off" for a in actions)
 
     def test_sleep_mode_triggers_darkness(self):
         actions = evaluate_automations(self.state, {"type": "mode_changed", "mode": "sleep"}, self.config)

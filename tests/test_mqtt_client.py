@@ -78,3 +78,14 @@ def test_owntracks_location_initializes_current_region():
     client, _, geofence, _ = _client()
     client._handle_owntracks({"_type": "location", "inregions": [" Home "]})
     geofence.assert_called_once_with("sync", "home")
+
+
+def test_every_owntracks_message_is_forwarded_for_history():
+    report = MagicMock()
+    client, _, _, _ = _client()
+    client._on_owntracks = report
+    payload = {"_type": "location", "lat": 41.1, "lon": 29.2, "tst": 1784358126}
+
+    client._handle_owntracks(payload, "owntracks/smart_room/iphone")
+
+    report.assert_called_once_with("owntracks/smart_room/iphone", payload)

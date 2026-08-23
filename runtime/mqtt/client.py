@@ -42,12 +42,14 @@ class MQTTClient:
         on_geofence: Callable[[str, str], None],
         on_command: Callable[[Dict[str, Any]], None],
         on_node_status: Optional[Callable[[bool, Optional[str]], None]] = None,
+        on_owntracks: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         self._config = config
         self._on_presence = on_presence
         self._on_geofence = on_geofence
         self._on_command = on_command
         self._on_node_status = on_node_status or (lambda _online, _ip: None)
+        self._on_owntracks = on_owntracks or (lambda _topic, _payload: None)
         self._client: Optional[Any] = None
         self._connected = False
         self._thread: Optional[threading.Thread] = None
@@ -155,7 +157,7 @@ class MQTTClient:
 
         # OwnTracks geofence events
         if "owntracks" in topic:
-            self._handle_owntracks(payload)
+            self._handle_owntracks(payload, topic)
         # ESPresense BLE presence
         elif "espresense" in topic:
             self._handle_espresense(topic, payload)
@@ -163,8 +165,9 @@ class MQTTClient:
         elif self._commands_enabled and topic == self._command_topic:
             self._on_command(payload)
 
-    def _handle_owntracks(self, payload: Dict[str, Any]) -> None:
+    def _handle_owntracks(self, payload: Dict[str, Any], topic: str = "") -> None:
         """Process OwnTracks geofence enter/leave events."""
+        self._on_owntracks(topic, payload)
         event_type = payload.get("_type", "")
         if event_type == "transition":
             event = payload.get("event", "")

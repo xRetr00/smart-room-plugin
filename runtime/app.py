@@ -34,26 +34,21 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from typing import Any, Dict, Optional
-from pathlib import Path
-
-# Add parent paths when run as __main__
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-from plugins.smart_room.runtime.models import ActiveAlarm, Alarm, RoomState, now_iso, DeviceHealth, VALID_MODES
-from plugins.smart_room.runtime.state_store import (
+from .models import ActiveAlarm, Alarm, RoomState, VisionState, now_iso, DeviceHealth, VALID_MODES
+from .state_store import (
+    append_location_report,
     append_transition,
     load_config,
     load_state,
-    publish_alarm,
-    publish_welcome,
     save_state,
 )
-from plugins.smart_room.runtime.event_bus import EventBus
-from plugins.smart_room.runtime.presence_fusion import fuse
-from plugins.smart_room.runtime.automation_engine import evaluate_automations, Action
-from plugins.smart_room.runtime.scheduler import Scheduler
-from plugins.smart_room.runtime.command_router import CommandRouter
-from plugins.smart_room.runtime.health import check_device_health
+from .event_bus import EventBus
+from .presence_fusion import fuse
+from .automation_engine import evaluate_automations, Action
+from .scheduler import Scheduler
+from .command_router import CommandRouter
+from .health import check_device_health
+from .paths import smart_room_home
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +72,20 @@ class Runtime:
     def __init__(self, config: Dict[str, Any]):
         self._config = config
         self._state = load_state()
+        if not self._state.last_owner_seen_at and self._state.presence.source == "ble":
+            self._state.last_owner_seen_at = self._state.presence.last_seen
+        if self._state.modes.active_mode == "sleep":
+            restored = self._state.sleep_restore.get("mode")
+            self._state.modes.active_mode = (
+                restored if restored in VALID_MODES and restored not in {"sleep", "alarm"} else "off"
+            )
+            self._state.modes.work_return = False
+            self._state.sleep_restore = {}
+            save_state(self._state)
+            logger.warning("Discarded persisted Sleep mode during runtime startup")
+        elif self._state.sleep_restore:
+            self._state.sleep_restore = {}
+            save_state(self._state)
         self._bus = EventBus()
         self._running = False
         self._exit_event = threading.Event()
@@ -84,6 +93,8 @@ class Runtime:
         self._command_lock = threading.RLock()
         self._pending_mode_timer: Optional[threading.Timer] = None
         self._pending_welcome_timer: Optional[threading.Timer] = None
+        self._pending_entry_at: Optional[str] = None
+        self._pending_entry_should_welcome = False
         self._ble_detected = False
         self._ble_rssi: Optional[int] = None
         self._last_ble_seen_monotonic = 0.0
@@ -91,6 +102,7 @@ class Runtime:
         # for the configured timeout.  HE20 can briefly report "none" between
         # occupied samples, so a single clear poll must never turn lights off.
         self._room_clear_emitted = not self._state.mmwave.occupied
+        self._mmwave_occupied_since = time.monotonic() if self._state.mmwave.occupied else 0.0
         self._owner_name = str(config.get("owner", "Shereef")).strip() or "Shereef"
         self._owner = self._owner_name.lower()
         self._owner_device_id = str(
@@ -106,7 +118,7 @@ class Runtime:
         self._tuya = None
         self._scheduler = None
         self._router = None
-        self._sound_events = None
+        self._vision = None
         self._rpc_thread: Optional[threading.Thread] = None
         self._poll_thread: Optional[threading.Thread] = None
 
@@ -123,20 +135,21 @@ class Runtime:
 
         # Initialize Tuya controller (fallback path)
         try:
-            from plugins.smart_room.runtime.tuya.controller import TuyaController
+            from .tuya.controller import TuyaController
             self._tuya = TuyaController(self._config)
         except Exception as e:
             logger.warning("Tuya controller init failed (non-fatal): %s", e)
 
         # Initialize MQTT client
         try:
-            from plugins.smart_room.runtime.mqtt.client import MQTTClient
+            from .mqtt.client import MQTTClient
             self._mqtt = MQTTClient(
                 config=self._config,
                 on_presence=self._on_ble_presence,
                 on_geofence=self._on_geofence,
                 on_command=self._on_mqtt_command,
                 on_node_status=self._on_esp32_status,
+                on_owntracks=self._on_owntracks,
             )
             self._mqtt.start()
         except Exception as e:
@@ -158,21 +171,30 @@ class Runtime:
         self._running = True
         self._start_rpc_server()
 
+        # Smart Room is the single owner of the physical camera. Vision starts
+        # after RPC, so model loading/downloads never prevent the sidecar from
+        # becoming reachable and reporting honest progress.
+        try:
+            from .vision import VisionWorker
+
+            vision_config = self._config.get("vision") or {"enabled": True}
+            if "enabled" not in vision_config:
+                vision_config = {**vision_config, "enabled": True}
+            self._vision = VisionWorker(
+                vision_config,
+                self._publish_vision_state,
+                self._emit_event,
+            )
+            self._vision.start()
+        except Exception as exc:
+            logger.warning("Vision worker init failed (non-fatal): %s", exc, exc_info=True)
+            self._publish_vision_state(
+                VisionState(enabled=True, running=False, stale=True, error=str(exc)[:200])
+            )
+
         # Start device poller
         self._poll_thread = threading.Thread(target=self._device_poll_loop, daemon=True, name="smart_room_poll")
         self._poll_thread.start()
-
-        # Optional plugin-local clap detector. It owns its microphone and model;
-        # the Marvi core audio/STT path is intentionally not involved.
-        try:
-            from plugins.smart_room.runtime.sound_events import SoundEventListener
-
-            self._sound_events = SoundEventListener(
-                self._config.get("sound_events") or {}, self._on_sound_action
-            )
-            self._sound_events.start()
-        except Exception as e:
-            logger.warning("Sound events init failed (non-fatal): %s", e)
 
         self._resume_active_alarm()
         self._resume_pending_mode()
@@ -296,8 +318,16 @@ class Runtime:
                 "presence_cleared",
                 "phone_location_changed",
                 "device_offline",
+                "light_changed",
                 "sleep_cancelled",
                 "alarm_acknowledged",
+                "room_entry",
+                "room_welcome",
+                "visitor_report",
+                "alarm_requested",
+                "vision_visitor_seen",
+                "vision_gesture",
+                "vision_sleep_state",
             }:
                 event["summary"] = data.get("summary") or event_type.replace("_", " ")
                 append_transition(event)
@@ -305,6 +335,13 @@ class Runtime:
             save_state(self._state)
         for action in actions:
             self._execute_action(action)
+
+    def _publish_vision_state(self, vision: VisionState) -> None:
+        """Persist only bounded facts from the camera worker."""
+        with self._state_lock:
+            self._state.vision = vision
+            self._state.last_updated = now_iso()
+            save_state(self._state)
 
     def _on_ble_presence(
         self, detected: bool, rssi: Optional[int], identity: Optional[str] = None
@@ -324,6 +361,7 @@ class Runtime:
                 self._ble_rssi = rssi
                 if detected:
                     self._last_ble_seen_monotonic = time.monotonic()
+                    self._state.last_owner_seen_at = now_iso()
             was_present = self._state.presence.detected
             self._update_presence(other_identity_detected=detected and not is_owner)
             present = self._state.presence.detected
@@ -358,6 +396,21 @@ class Runtime:
             at=now_iso(),
             delivery_id=f"owntracks:{transition}:{zone}:{int(time.time())}",
             source="owntracks",
+        )
+
+    def _on_owntracks(self, topic: str, payload: Dict[str, Any]) -> None:
+        record = append_location_report(topic, payload)
+        if record.get("duplicate"):
+            logger.debug("Ignored duplicate retained OwnTracks report at=%s", record["reported_at"])
+            return
+        if record["type"] == "location" and record["zone"]:
+            with self._state_lock:
+                self._state.location.last_geofence_at = record["reported_at"]
+                save_state(self._state)
+        logger.info(
+            "OwnTracks report recorded type=%s event=%s zone=%s at=%s lat=%s lon=%s accuracy_m=%s",
+            record["type"], record["event"], record["zone"], record["reported_at"],
+            record["latitude"], record["longitude"], record["accuracy_m"],
         )
 
     @_state_locked
@@ -487,23 +540,6 @@ class Runtime:
         elif action == "set_color":
             self.set_light(rgb=payload.get("rgb"))
 
-    def _on_sound_action(self, action: str) -> None:
-        """Apply a locally detected clap sequence without entering Marvi core."""
-        if action == "toggle_light":
-            current = self._state.light.on
-            if self._tuya:
-                status = self._tuya.get_light_status()
-                if status.get("success"):
-                    current = bool(status.get("on"))
-            self.set_light(on=not current, manual=True)
-            logger.info("Double clap toggled the light %s", "off" if current else "on")
-        elif action == "sleep":
-            if self._state.modes.active_mode != "sleep":
-                self.set_mode("sleep", reason="sound_event")
-                logger.info("Triple clap activated sleep mode")
-        else:
-            logger.warning("Unknown sound action: %s", action)
-
     # -------------------------------------------------------------------
     # Device polling
     # -------------------------------------------------------------------
@@ -525,7 +561,6 @@ class Runtime:
         offline_events = []
         with self._state_lock:
             was_present = self._state.presence.detected
-            was_occupied = self._state.mmwave.occupied
             if bulb_status is not None:
                 bulb = self._state.devices.setdefault("tuya_bulb", DeviceHealth())
                 if bulb_status.get("success"):
@@ -545,7 +580,12 @@ class Runtime:
             if he20_status is not None:
                 he20 = self._state.devices.setdefault("tuya_he20", DeviceHealth())
                 if he20_status.get("success"):
-                    self._state.mmwave.occupied = he20_status.get("occupied", False)
+                    occupied = bool(he20_status.get("occupied", False))
+                    if occupied and not self._state.mmwave.occupied:
+                        self._mmwave_occupied_since = time.monotonic()
+                    elif not occupied:
+                        self._mmwave_occupied_since = 0.0
+                    self._state.mmwave.occupied = occupied
                     if self._state.mmwave.occupied:
                         self._state.mmwave.last_seen = now_iso()
                     he20.online = True
@@ -563,17 +603,22 @@ class Runtime:
                 device = self._state.devices.setdefault(state_name, DeviceHealth())
                 device.queue_depth = int(metrics.get("queue_depth", 0))
                 device.circuit_open = bool(metrics.get("circuit_open", False))
-            occupied = self._state.mmwave.occupied
             save_state(self._state)
 
         for device in offline_events:
             self._emit_event("device_offline", {"device": device})
-        self._handle_welcome_transition(was_occupied, occupied)
 
         wifi_detected = self._probe_wifi_presence()
         _, light_should_off = self._update_presence(wifi_detected=wifi_detected)
         with self._state_lock:
-            if self._state.mmwave.occupied:
+            debounce = max(0, float(((self._config.get("automations") or {}).get("adaptive_light") or {}).get("debounce", 3)))
+            stable_entry = bool(
+                self._state.mmwave.occupied
+                and self._room_clear_emitted
+                and self._mmwave_occupied_since
+                and time.monotonic() - self._mmwave_occupied_since >= debounce
+            )
+            if stable_entry:
                 self._room_clear_emitted = False
             present = self._state.presence.detected
             source = self._state.presence.source
@@ -581,6 +626,10 @@ class Runtime:
             if should_clear:
                 self._room_clear_emitted = True
             snapshot = self._state.to_dict()
+        if stable_entry:
+            self._handle_welcome_transition(False, True)
+        elif should_clear:
+            self._handle_welcome_transition(True, False)
         if not was_present and present:
             self._emit_event("presence_detected", {"source": source})
         elif should_clear:
@@ -592,8 +641,6 @@ class Runtime:
 
     def _handle_welcome_transition(self, was_occupied: bool, occupied: bool) -> None:
         welcome = self._config.get("welcome") or {}
-        if not welcome.get("enabled", True):
-            return
         if not occupied:
             if was_occupied:
                 self._state.room_empty_since = now_iso()
@@ -605,16 +652,20 @@ class Runtime:
         empty_since = self._state.room_empty_since
         self._state.room_empty_since = None
         save_state(self._state)
+        should_welcome = False
         try:
             empty_at = datetime.fromisoformat(str(empty_since).replace("Z", "+00:00"))
             empty_seconds = (datetime.now(timezone.utc) - empty_at.astimezone(timezone.utc)).total_seconds()
+            should_welcome = bool(welcome.get("enabled", True)) and empty_seconds >= max(
+                60, int(welcome.get("reset_after_seconds", 3600))
+            )
         except (TypeError, ValueError):
-            return
-        if empty_seconds < max(60, int(welcome.get("reset_after_seconds", 3600))):
-            return
+            pass
 
         if self._pending_welcome_timer:
             self._pending_welcome_timer.cancel()
+        self._pending_entry_at = now_iso()
+        self._pending_entry_should_welcome = should_welcome
         delay = max(0, int(welcome.get("identity_grace_seconds", 4)))
         self._pending_welcome_timer = threading.Timer(delay, self._deliver_welcome)
         self._pending_welcome_timer.daemon = True
@@ -623,11 +674,102 @@ class Runtime:
     def _deliver_welcome(self) -> None:
         self._pending_welcome_timer = None
         with self._state_lock:
-            if not self._state.mmwave.occupied or self._state.modes.active_mode == "sleep":
+            if not self._state.mmwave.occupied:
                 return
-            owner_detected = self._ble_detected
+            entry_at = self._pending_entry_at or now_iso()
+            should_welcome = self._pending_entry_should_welcome and self._state.modes.active_mode != "sleep"
+            self._pending_entry_at = None
+            self._pending_entry_should_welcome = False
+            phone_home = self._state.location.home
+            classification, identity_reason = self._classify_entry(entry_at)
+            owner_detected = classification == "owner"
+            pending_entries = list(self._state.unreported_visitor_entries) if owner_detected else []
+            if not owner_detected:
+                self._state.unreported_visitor_entries.append({
+                    "at": entry_at,
+                    "classification": classification,
+                    "owner_phone_home": phone_home,
+                    "identity_reason": identity_reason,
+                })
+                self._state.unreported_visitor_entries = self._state.unreported_visitor_entries[-100:]
 
-        self._publish_welcome(owner_detected, self._owner_name, record_arrival=True)
+        face_visitors: list[Dict[str, Any]] = []
+        if owner_detected and self._vision:
+            result = self._vision.visitors()
+            face_visitors = [
+                {
+                    "id": item.get("id"),
+                    "at": item.get("at"),
+                    "classification": "unknown_face",
+                    "thumbnail": item.get("thumbnail"),
+                    "source": "vision",
+                }
+                for item in result.get("visitors", [])
+                if isinstance(item, dict)
+            ]
+            pending_entries.extend(face_visitors)
+
+        self._emit_event("room_entry", {
+            "entry_at": entry_at,
+            "classification": classification,
+            "identity_reason": identity_reason,
+            "owner_phone_home": phone_home,
+            "summary": f"{classification.replace('_', ' ').title()} entered the room",
+        })
+        if owner_detected and pending_entries:
+            notice = self._visitor_notice(pending_entries)
+            self._emit_event(
+                "visitor_report",
+                {
+                    "entries": pending_entries,
+                    "message": notice,
+                    "summary": notice,
+                },
+            )
+            with self._state_lock:
+                reported = {str(item.get("at")) for item in pending_entries}
+                self._state.unreported_visitor_entries = [
+                    item for item in self._state.unreported_visitor_entries
+                    if str(item.get("at")) not in reported
+                ]
+                save_state(self._state)
+            if face_visitors and self._vision:
+                self._vision.mark_visitors_reported(
+                    [int(item["id"]) for item in face_visitors if item.get("id") is not None]
+                )
+        if not should_welcome:
+            return
+        self._publish_welcome(
+            owner_detected,
+            self._owner_name,
+            record_arrival=True,
+            visitor_entries=pending_entries,
+        )
+
+    @staticmethod
+    def _within_seconds(value: Optional[str], reference: str, seconds: int) -> bool:
+        try:
+            then = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            now = datetime.fromisoformat(reference.replace("Z", "+00:00"))
+            return -30 <= (now - then).total_seconds() <= seconds
+        except (TypeError, ValueError):
+            return False
+
+    def _classify_entry(self, entry_at: str) -> tuple[str, str]:
+        if self._ble_detected:
+            self._state.last_owner_seen_at = entry_at
+            return "owner", "ble"
+        if not self._state.location.home:
+            return "unknown_visitor", "owner_phone_away"
+
+        window = max(60, int((self._config.get("welcome") or {}).get("owner_evidence_window_seconds", 3600)))
+        if self._within_seconds(self._state.location.last_geofence_at, entry_at, window):
+            self._state.last_owner_seen_at = entry_at
+            return "owner", "owntracks_recent"
+        if self._within_seconds(self._state.last_owner_seen_at, entry_at, window):
+            self._state.last_owner_seen_at = entry_at
+            return "owner", "recent_owner"
+        return "guest", "phone_home_without_recent_owner_evidence"
 
     def test_welcome(self, audience: str) -> None:
         """Generate a real welcome preview without changing arrival state."""
@@ -643,54 +785,61 @@ class Runtime:
         thread.start()
 
     def _publish_welcome(
-        self, owner_detected: bool, owner_name: str, *, record_arrival: bool
+        self,
+        owner_detected: bool,
+        owner_name: str,
+        *,
+        record_arrival: bool,
+        visitor_entries: Optional[list[Dict[str, Any]]] = None,
     ) -> None:
-        """Generate through auxiliary.voice_instant and publish to the TTS lane."""
-
-        fallback = f"Welcome back, {owner_name}." if owner_detected else "Welcome."
-        try:
-            from agent.auxiliary_client import call_llm
-            from agent.message_content import flatten_message_text
-            from agent.prompt_builder import load_soul_md
-
-            identity = (
-                f"The detected person is the owner, named {owner_name}. Include that exact name."
-                if owner_detected
-                else "The detected person is a guest whose name is unknown. Do not invent a name."
-            )
-            soul = (load_soul_md() or "")[:4000]
-            response = call_llm(
-                task="voice_instant",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Write exactly one short, natural spoken welcome in Marvi's personality. "
-                            "Vary the wording, use at most two brief sentences, and do not ask a question."
-                            + (f"\n\nMarvi personality:\n{soul}" if soul else "")
-                        ),
-                    },
-                    {"role": "user", "content": identity},
-                ],
-                temperature=0.9,
-                max_tokens=80,
-                timeout=20,
-            )
-            greeting = " ".join(flatten_message_text(response.choices[0].message.content).split()).strip(' "')
-            if not greeting:
-                greeting = fallback
-            if owner_detected and owner_name.casefold() not in greeting.casefold():
-                greeting = f"{owner_name}, {greeting[:1].lower()}{greeting[1:]}"
-            greeting = greeting[:300]
-        except Exception:
-            logger.warning("Could not generate room welcome; using fallback", exc_info=True)
-            greeting = fallback
-
-        publish_welcome(greeting)
+        """Publish a structured welcome event for Marvi to phrase and deliver."""
+        visitor_notice = self._visitor_notice(visitor_entries or []) if owner_detected else ""
+        message = (
+            f"Welcome back, {owner_name}." + (f" {visitor_notice}" if visitor_notice else "")
+            if owner_detected
+            else f"Welcome. {owner_name} isn't here right now."
+        )
+        self._emit_event(
+            "room_welcome",
+            {
+                "audience": "owner" if owner_detected else "guest",
+                "owner_name": owner_name,
+                "visitor_entries": visitor_entries or [],
+                "message": message,
+                "summary": "Smart Room welcome",
+            },
+        )
         if record_arrival:
             with self._state_lock:
                 self._state.last_welcome_at = now_iso()
                 save_state(self._state)
+
+    @staticmethod
+    def _visitor_time_token(entries: list[Dict[str, Any]]) -> str:
+        if not entries:
+            return ""
+        try:
+            stamp = datetime.fromisoformat(str(entries[-1].get("at", "")).replace("Z", "+00:00"))
+            return stamp.astimezone().strftime("%I:%M").lstrip("0")
+        except (TypeError, ValueError):
+            return ""
+
+    @classmethod
+    def _visitor_notice(cls, entries: list[Dict[str, Any]]) -> str:
+        if not entries:
+            return ""
+        entry = entries[-1]
+        try:
+            raw_stamp = datetime.fromisoformat(str(entry.get("at", "")).replace("Z", "+00:00"))
+            stamp = raw_stamp.astimezone()
+            local_now = datetime.now().astimezone()
+            day = "today" if stamp.date() == local_now.date() else stamp.strftime("on %B %d")
+            when = f"{stamp.strftime('%I:%M %p').lstrip('0')} {day}"
+        except (TypeError, ValueError):
+            when = "an unknown time"
+        subject = "A guest" if entry.get("classification") == "guest" else "Someone"
+        extra = f" There were {len(entries)} entries in total." if len(entries) > 1 else ""
+        return f"{subject} entered the room at {when} while you were away from the room.{extra}"
 
     def _probe_wifi_presence(self) -> bool:
         config = (self._config.get("presence") or {}).get("wifi_ping") or {}
@@ -884,6 +1033,8 @@ class Runtime:
                     }
                 self._state.modes.active_mode = mode
                 self._state.modes.work_return = mode == "sleep" and reason == "work_return"
+                if mode != "sleep":
+                    self._state.sleep_restore = {}
                 if reason == "work_return":
                     self._state.flags.work_sleep_done_today = True
                 elif reason == "evening":
@@ -912,7 +1063,15 @@ class Runtime:
             if mode in {"off", "sleep"}:
                 self.set_light(on=False)
             elif mode == "alarm" and active_alarm:
-                publish_alarm(active_alarm.id, f"Your alarm {active_alarm.name}. Are you awake?", active=True)
+                self._emit_event(
+                    "alarm_requested",
+                    {
+                        "alarm_id": active_alarm.id,
+                        "active": True,
+                        "message": f"Your alarm {active_alarm.name}. Are you awake?",
+                        "summary": f"Alarm: {active_alarm.name}",
+                    },
+                )
             elif scene:
                 self.set_light(
                     on=True,
@@ -925,7 +1084,10 @@ class Runtime:
                     self._state.light.scene = mode
                     save_state(self._state)
 
-            self._emit_event("mode_changed", {"mode": mode, "reason": reason})
+            self._emit_event(
+                "mode_changed",
+                {"mode": mode, "reason": reason, "source": "manual" if reason == "manual" else "automation"},
+            )
 
     def set_light(
         self,
@@ -950,6 +1112,13 @@ class Runtime:
         if manual:
             self._cancel_pending_mode()
         with self._state_lock:
+            if manual and self._state.modes.active_mode == "sleep":
+                restored = self._state.sleep_restore.get("mode")
+                self._state.modes.active_mode = (
+                    restored if restored in VALID_MODES and restored not in {"sleep", "alarm"} else "off"
+                )
+                self._state.modes.work_return = False
+                self._state.sleep_restore = {}
             if on is not None:
                 self._state.light.on = on
             if brightness is not None:
@@ -983,6 +1152,17 @@ class Runtime:
             self._state.last_updated = now_iso()
             self._state.event_id += 1
             save_state(self._state)
+        self._emit_event(
+            "light_changed",
+            {
+                "source": "manual" if manual else "automation",
+                "success": bool(device_result.get("success")),
+                "on": on,
+                "brightness": brightness,
+                "color_temp": color_temp,
+                "rgb": rgb,
+            },
+        )
         return {
             "success": bool(device_result.get("success")),
             "logical_applied": True,
@@ -1007,9 +1187,9 @@ class Runtime:
                 save_state(self._state)
 
             if was_work:
-                self._emit_event("sleep_cancelled", {"reason": "work_return"})
+                self._emit_event("sleep_cancelled", {"reason": "work_return", "source": "manual"})
             elif was_evening:
-                self._emit_event("sleep_cancelled", {"reason": "evening"})
+                self._emit_event("sleep_cancelled", {"reason": "evening", "source": "manual"})
 
             light = restore.get("light") if isinstance(restore.get("light"), dict) else {}
             if occupied:
@@ -1025,7 +1205,7 @@ class Runtime:
                 if occupied and light.get("scene"):
                     self._state.light.scene = str(light["scene"])
                 previous_mode = restore.get("mode")
-                if previous_mode in {"reading", "focus", "relax", "night"}:
+                if previous_mode in {"normal", "reading", "focus", "relax", "night"}:
                     self._state.modes.active_mode = previous_mode
                 self._state.sleep_restore = {}
                 save_state(self._state)
@@ -1124,7 +1304,6 @@ class Runtime:
                 )
             else:
                 self.set_light(on=False)
-            publish_alarm(active.id, "", active=False)
             self._emit_event("alarm_acknowledged", {"alarm_id": active.id, "reason": reason})
             return {"success": True, "active": False, "alarm_id": active.id}
 
@@ -1159,14 +1338,46 @@ class Runtime:
             "active_alarm": self.get_active_alarm(),
             "alarms": self.list_alarms(),
             "tuya": self._tuya.health() if self._tuya else {},
-            "sound_events": self._sound_events.status() if self._sound_events else {
-                "enabled": False,
-                "running": False,
-            },
+            "vision": self._vision.status() if self._vision else self._state.vision.__dict__.copy(),
         }
 
+    def vision_observe(self) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.observe()
+
+    def vision_describe(self) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.describe()
+
+    def vision_people(self) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable", "people": []}
+        return self._vision.people()
+
+    def vision_visitors(self) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable", "visitors": []}
+        return self._vision.visitors()
+
+    def vision_enroll_owner(self, name: str, seconds: float = 4.0) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.enroll_owner(name, seconds)
+
+    def vision_approve(self, sighting_id: int, name: str, owner: bool = False) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.approve(sighting_id, name, owner=owner)
+
+    def vision_reject(self, sighting_id: int) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.reject(sighting_id)
+
     def run_diagnostic(self) -> Dict[str, Any]:
-        from plugins.smart_room.runtime.command_router import _redact_config
+        from .command_router import _redact_config
 
         bulb = self._tuya.get_light_status() if self._tuya else {"success": False, "error": "not configured"}
         he20 = self._tuya.get_mmwave_status() if self._tuya else {"success": False, "error": "not configured"}
@@ -1204,8 +1415,9 @@ class Runtime:
         logger.info("Smart room runtime shutting down...")
         if self._scheduler:
             self._scheduler.stop()
-        if self._sound_events:
-            self._sound_events.stop()
+        if self._vision:
+            self._vision.stop()
+            self._vision = None
         self._cancel_pending_mode(clear_state=False)
         if self._pending_welcome_timer:
             self._pending_welcome_timer.cancel()
@@ -1227,6 +1439,7 @@ class Runtime:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_SCENES = {
+    "normal": {"color_temp": 4000, "brightness": 70, "transition": 2},
     "reading": {"color_temp": 3000, "brightness": 70, "transition": 2},
     "focus": {"color_temp": 5000, "brightness": 100, "transition": 2},
     "relax": {"color_temp": 2700, "rgb": [255, 180, 80], "brightness": 40, "transition": 3},
@@ -1241,8 +1454,6 @@ def _rpc_port() -> int:
 
 def main() -> None:
     """Entry point for the runtime process."""
-    from hermes_constants import get_hermes_home
-
     class JsonFormatter(logging.Formatter):
         def format(self, record: logging.LogRecord) -> str:
             payload = {
@@ -1255,7 +1466,7 @@ def main() -> None:
                 payload["error"] = self.formatException(record.exc_info)
             return json.dumps(payload, ensure_ascii=False)
 
-    log_path = Path(get_hermes_home()) / "smart_room" / "runtime.log"
+    log_path = smart_room_home() / "runtime.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
     handler.setFormatter(JsonFormatter())

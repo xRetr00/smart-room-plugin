@@ -1,13 +1,15 @@
 name: smart_room
-version: 0.6.0
-description: "Smart room engine for Marvi — presence fusion, Tuya LAN control, automations, YAMNet clap controls, and world-awareness context. Native Windows, no Docker/WSL."
+version: 0.7.0
+description: "Independent smart room sidecar for Marvi — room control, presence fusion, and single-owner local vision. Native Windows, no Docker/WSL."
 author: xRetro Labs
 kind: backend
 platforms:
   - windows
 pip_dependencies:
-  - ai-edge-litert==2.1.6
-  - sounddevice==0.5.5
+  - insightface>=0.7,<1
+  - onnxruntime>=1.17,<2
+  - opencv-python-headless>=4.10,<5
+  - mediapipe>=0.10,<1
 provides_tools:
   - smart_room_state
   - smart_room_set_mode
@@ -17,6 +19,8 @@ provides_tools:
   - smart_room_health
   - smart_room_diagnostic
   - smart_room_alarm
+  - smart_room_vision
+  - smart_room_vision_identity
 hooks:
   - on_gateway_start
   - on_gateway_stop

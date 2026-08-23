@@ -16,7 +16,7 @@ from __future__ import annotations
 import platform
 import logging
 
-from plugins.smart_room.tools import (
+from .tools import (
     SMART_ROOM_STATE_SCHEMA,
     SMART_ROOM_SET_MODE_SCHEMA,
     SMART_ROOM_SET_LIGHT_SCHEMA,
@@ -25,6 +25,8 @@ from plugins.smart_room.tools import (
     SMART_ROOM_HEALTH_SCHEMA,
     SMART_ROOM_DIAGNOSTIC_SCHEMA,
     SMART_ROOM_ALARM_SCHEMA,
+    SMART_ROOM_VISION_SCHEMA,
+    SMART_ROOM_VISION_IDENTITY_SCHEMA,
     check_smart_room_requirements,
     handle_smart_room_state,
     handle_smart_room_set_mode,
@@ -34,10 +36,12 @@ from plugins.smart_room.tools import (
     handle_smart_room_health,
     handle_smart_room_diagnostic,
     handle_smart_room_alarm,
+    handle_smart_room_vision,
+    handle_smart_room_vision_identity,
 )
-from plugins.smart_room.context import build_context_line
-from plugins.smart_room import process_manager
-from plugins.smart_room.runtime.state_store import load_config
+from .context import build_context_line
+from . import process_manager
+from .runtime.state_store import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,8 @@ _TOOLS = (
     ("smart_room_health",      SMART_ROOM_HEALTH_SCHEMA,      handle_smart_room_health,      "💚"),
     ("smart_room_diagnostic",  SMART_ROOM_DIAGNOSTIC_SCHEMA,  handle_smart_room_diagnostic,  "🔍"),
     ("smart_room_alarm",       SMART_ROOM_ALARM_SCHEMA,       handle_smart_room_alarm,       "⏰"),
+    ("smart_room_vision",      SMART_ROOM_VISION_SCHEMA,      handle_smart_room_vision,      "◉"),
+    ("smart_room_vision_identity", SMART_ROOM_VISION_IDENTITY_SCHEMA, handle_smart_room_vision_identity, "◎"),
 )
 
 

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 
-VALID_MODES = {"off", "reading", "focus", "relax", "night", "sleep", "alarm"}
+VALID_MODES = {"off", "normal", "reading", "focus", "relax", "night", "sleep", "alarm"}
 
 
 @dataclass
@@ -41,7 +41,7 @@ class LightState:
     brightness: int = 0  # 0-100
     color_temp: int = 3000  # Kelvin
     rgb: Optional[List[int]] = None  # [R, G, B] or None for white mode
-    scene: str = "off"  # "reading", "focus", "relax", "night", "alarm", "off", "custom"
+    scene: str = "off"  # "normal", "reading", "focus", "relax", "night", "alarm", "off", "custom"
     confirmed: bool = False
     last_error: Optional[str] = None
 
@@ -115,6 +115,38 @@ class ActiveAlarm:
 
 
 @dataclass
+class VisionState:
+    """Bounded camera-derived facts published by the sidecar.
+
+    Frames and embeddings never enter this state. Consumers receive only
+    freshness, capability, identity, activity, gesture, and posture facts.
+    """
+
+    enabled: bool = False
+    running: bool = False
+    camera_index: int = 0
+    camera_open: bool = False
+    last_frame_at: Optional[str] = None
+    last_inference_at: Optional[str] = None
+    person_count: int = 0
+    owner_visible: bool = False
+    owner_confidence: float = 0.0
+    identities: List[str] = field(default_factory=list)
+    pending_visitors: int = 0
+    activity: str = "unknown"  # unknown | still | moving
+    gesture: Optional[str] = None
+    gesture_confidence: float = 0.0
+    sleep_state: str = "unknown"  # unknown | awake | resting
+    stale: bool = True
+    error: Optional[str] = None
+    capabilities: Dict[str, bool] = field(default_factory=lambda: {
+        "faces": False,
+        "gestures": False,
+        "posture": False,
+    })
+
+
+@dataclass
 class RoomState:
     """Full room state snapshot — serialized to state.json."""
     presence: Presence = field(default_factory=Presence)
@@ -123,6 +155,7 @@ class RoomState:
     modes: Modes = field(default_factory=Modes)
     flags: DailyFlags = field(default_factory=DailyFlags)
     location: PhoneLocation = field(default_factory=PhoneLocation)
+    vision: VisionState = field(default_factory=VisionState)
     devices: Dict[str, DeviceHealth] = field(default_factory=dict)
     weather: Dict[str, Any] = field(default_factory=dict)
     sun: Dict[str, Any] = field(default_factory=dict)
@@ -131,6 +164,8 @@ class RoomState:
     sleep_restore: Dict[str, Any] = field(default_factory=dict)
     room_empty_since: Optional[str] = None
     last_welcome_at: Optional[str] = None
+    last_owner_seen_at: Optional[str] = None
+    unreported_visitor_entries: List[Dict[str, Any]] = field(default_factory=list)
     alarms: List[Alarm] = field(default_factory=list)
     active_alarm: Optional[ActiveAlarm] = None
     alarm_restore: Dict[str, Any] = field(default_factory=dict)
@@ -157,7 +192,7 @@ class RoomState:
             active = raw_modes.get("active_mode")
             if active not in VALID_MODES:
                 active = next(
-                    (name for name in ("reading", "focus", "relax", "night", "sleep", "alarm") if raw_modes.get(name)),
+                    (name for name in ("normal", "reading", "focus", "relax", "night", "sleep", "alarm") if raw_modes.get(name)),
                     "off",
                 )
             override = raw_modes.get("manual_override", "none")
@@ -177,6 +212,11 @@ class RoomState:
             # One-time migration from the removed iOS Shortcuts design.
             location.setdefault("last_geofence_at", location.pop("last_webhook_at", None))
             state.location = PhoneLocation(**location)
+        if isinstance(d.get("vision"), dict):
+            vision = dict(d["vision"])
+            defaults = VisionState()
+            allowed = defaults.__dict__.keys()
+            state.vision = VisionState(**{key: value for key, value in vision.items() if key in allowed})
         if "devices" in d:
             state.devices = {
                 k: DeviceHealth(**v) for k, v in d["devices"].items()
@@ -193,6 +233,10 @@ class RoomState:
             state.sleep_restore = d["sleep_restore"]
         state.room_empty_since = d.get("room_empty_since")
         state.last_welcome_at = d.get("last_welcome_at")
+        state.last_owner_seen_at = d.get("last_owner_seen_at")
+        state.unreported_visitor_entries = [
+            item for item in d.get("unreported_visitor_entries", []) if isinstance(item, dict)
+        ][-100:]
         state.alarms = [Alarm(**item) for item in d.get("alarms", []) if isinstance(item, dict)]
         if isinstance(d.get("active_alarm"), dict):
             state.active_alarm = ActiveAlarm(**d["active_alarm"])

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from plugins.smart_room.bridge import read_state_snapshot, build_context_line
+from .bridge import read_state_snapshot, build_context_line
 
 logger = logging.getLogger(__name__)
 

@@ -15,13 +15,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from hermes_constants import get_hermes_home
+from .runtime.paths import secrets_path, smart_room_home
 
 _lock = threading.RLock()
 _supervisor_stop = threading.Event()
 _supervisor_thread: Optional[threading.Thread] = None
 _supervisor_config: Dict[str, Any] = {}
-_supervisor_home: Optional[Path] = None
+_supervisor_root: Optional[Path] = None
 _process: Optional[subprocess.Popen] = None
 _atexit_registered = False
 
@@ -55,7 +55,7 @@ def _start_lock():
 
 
 def _root() -> Path:
-    return (_supervisor_home or Path(get_hermes_home())) / "smart_room"
+    return _supervisor_root or smart_room_home()
 
 
 def _active_file() -> Path:
@@ -112,9 +112,19 @@ def _clear_rpc_token() -> None:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    from gateway.status import _pid_exists
+    if os.name == "nt":
+        import ctypes
 
-    return _pid_exists(pid)
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
 
 
 def _rpc_port(config: Dict[str, Any]) -> int:
@@ -122,15 +132,10 @@ def _rpc_port(config: Dict[str, Any]) -> int:
 
 
 def _call_runtime(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Call the runtime under the supervisor's captured profile context."""
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from plugins.smart_room.bridge import call_runtime
+    """Call the authenticated loopback runtime."""
+    from .bridge import call_runtime
 
-    token = set_hermes_home_override(_root().parent)
-    try:
-        return call_runtime(method, params)
-    finally:
-        reset_hermes_home_override(token)
+    return call_runtime(method, params)
 
 
 def _managed_runtime_alive(active: Optional[Dict[str, Any]] = None) -> bool:
@@ -185,16 +190,16 @@ def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -
 
         cfg = dict(config or _supervisor_config)
         _root().mkdir(parents=True, exist_ok=True)
+        if config is not None:
+            from .runtime.state_store import save_config
+
+            save_config(cfg)
         env = os.environ.copy()
-        # Desktop secret writes update the profile .env without mutating a
-        # long-lived gateway process. Resolve this plugin's credentials at
-        # spawn time so Apply/restart always gives the child the latest keys.
         from dotenv import dotenv_values
 
-        # Read the captured profile directly. Gateway multiplexing deliberately
-        # isolates process-global secrets, so a generic load_env() call may see
-        # a different active scope than this supervised child belongs to.
-        stored_env = dotenv_values(_root().parent / ".env", encoding="utf-8")
+        # Device credentials belong to the sidecar and remain under Marvi's
+        # local plugin-data root. They are passed only to the child process.
+        stored_env = dotenv_values(secrets_path(), encoding="utf-8")
         for name in (
             "SMART_ROOM_MQTT_USERNAME",
             "SMART_ROOM_MQTT_PASSWORD",
@@ -207,18 +212,21 @@ def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -
         token = secrets.token_urlsafe(32)
         _write_rpc_token(token)
         env["SMART_ROOM_RPC_TOKEN"] = token
-        # Preserve the exact profile selected by the gateway in the child.
-        env["MARVI_HOME"] = str(_root().parent)
+        env["MARVI_SMART_ROOM_HOME"] = str(_root())
         log_path = _root() / "runtime.log"
-        _process = subprocess.Popen(
-            [sys.executable, "-m", "plugins.smart_room.runtime.app"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-            close_fds=True,
-        )
+        bootstrap_log = _root() / "bootstrap.log"
+        plugin_root = Path(__file__).resolve().parent
+        with bootstrap_log.open("ab") as bootstrap:
+            _process = subprocess.Popen(
+                [sys.executable, "-m", "runtime.app"],
+                cwd=str(plugin_root),
+                stdin=subprocess.DEVNULL,
+                stdout=bootstrap,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                close_fds=True,
+            )
         record = {
             "pid": _process.pid,
             "started_at": time.time(),
@@ -227,7 +235,25 @@ def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -
             "rpc_port": _rpc_port(cfg),
         }
         _write_active(record)
-        return {"ok": True, **record}
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if _process.poll() is not None:
+                break
+            try:
+                if _call_runtime("ping", {}).get("success"):
+                    return {"ok": True, "ready": True, **record}
+            except RuntimeError:
+                time.sleep(0.1)
+        exit_code = _process.poll()
+        if exit_code is None:
+            _process.terminate()
+        _clear_active()
+        _clear_rpc_token()
+        _process = None
+        raise RuntimeError(
+            f"Smart Room runtime did not become ready; see {bootstrap_log}"
+            + (f" (exit code {exit_code})" if exit_code is not None else "")
+        )
 
 
 def stop(*, reason: str = "requested") -> Dict[str, Any]:
@@ -299,21 +325,15 @@ def _supervise_loop() -> None:
 
 
 def _supervise() -> None:
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-
-    token = set_hermes_home_override(_root().parent)
-    try:
-        _supervise_loop()
-    finally:
-        reset_hermes_home_override(token)
+    _supervise_loop()
 
 
 def start_supervisor(config: Dict[str, Any]) -> Dict[str, Any]:
     """Start the runtime and one gateway-lifetime crash monitor."""
-    global _atexit_registered, _supervisor_config, _supervisor_home, _supervisor_thread
+    global _atexit_registered, _supervisor_config, _supervisor_root, _supervisor_thread
     with _lock:
         _supervisor_config = dict(config)
-        _supervisor_home = Path(get_hermes_home())
+        _supervisor_root = smart_room_home()
         result = start(_supervisor_config)
         if _supervisor_thread and _supervisor_thread.is_alive():
             return result
@@ -329,7 +349,7 @@ def start_supervisor(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def stop_supervisor() -> None:
-    global _supervisor_config, _supervisor_home, _supervisor_thread
+    global _supervisor_config, _supervisor_root, _supervisor_thread
     _supervisor_stop.set()
     thread = _supervisor_thread
     if thread and thread is not threading.current_thread():
@@ -337,7 +357,7 @@ def stop_supervisor() -> None:
     _supervisor_thread = None
     stop(reason="gateway stopped")
     _supervisor_config = {}
-    _supervisor_home = None
+    _supervisor_root = None
 
 
 def health_check() -> Dict[str, Any]:

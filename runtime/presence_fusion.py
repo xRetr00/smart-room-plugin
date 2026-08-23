@@ -15,7 +15,7 @@ import logging
 import time
 from typing import Optional
 
-from plugins.smart_room.runtime.models import Presence, MmWaveState, PhoneLocation, now_iso
+from .models import Presence, MmWaveState, PhoneLocation, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,12 @@ def fuse(
         presence.identity_sticky = False
         presence.sticky_since = None
 
-    # Case 2: BLE absent but mmWave occupied and identity was previously established
+    # Keep non-BLE evidence honest; only BLE is allowed to become BLE-sticky.
+    elif not ble_detected and mmwave_occupied and presence.source in {"wifi_mmwave", "geofence_mmwave"}:
+        presence.detected = True
+        presence.last_seen = now
+
+    # Case 2: BLE absent but mmWave occupied and identity was previously established by BLE
     elif not ble_detected and mmwave_occupied and (presence.detected or presence.identity_sticky):
         # Sticky identity — phone is probably asleep
         if not presence.identity_sticky:

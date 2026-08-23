@@ -8,10 +8,12 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from hermes_cli.config import save_env_value
-from plugins.smart_room.bridge import call_runtime
-from plugins.smart_room.process_manager import start_supervisor, status, stop_supervisor
-from plugins.smart_room.runtime.state_store import load_config
+from dotenv import set_key
+
+from ..bridge import call_runtime
+from ..process_manager import start_supervisor, status, stop_supervisor
+from ..runtime.paths import secrets_path
+from ..runtime.state_store import load_config
 
 router = APIRouter()
 
@@ -80,7 +82,7 @@ async def get_status() -> dict:
 
 @router.post("/mode")
 async def set_mode(body: ModeBody) -> dict:
-    if body.mode not in {"reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
+    if body.mode not in {"normal", "reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
         raise HTTPException(status_code=400, detail="invalid mode")
     return await _rpc("set_mode", {"mode": body.mode})
 
@@ -150,7 +152,9 @@ async def save_secrets(body: SecretsBody) -> dict:
         "mqtt_password": "SMART_ROOM_MQTT_PASSWORD",
     }
     values = body.model_dump(exclude_none=True)
+    path = secrets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     for field, env_name in mapping.items():
         if field in values:
-            await asyncio.to_thread(save_env_value, env_name, values[field])
+            await asyncio.to_thread(set_key, str(path), env_name, values[field], "always")
     return {"ok": True, "saved": sorted(values)}

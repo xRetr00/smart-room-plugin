@@ -11,8 +11,9 @@ import logging
 import threading
 from typing import Any, Dict
 
-from plugins.smart_room.runtime.models import RoomState
-from plugins.smart_room.runtime.health import check_device_health
+from .models import RoomState
+from .health import check_device_health
+from .state_store import load_location_reports
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,18 @@ class CommandRouter:
         }
 
     def _handle_get_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        return {"success": True, "state": self._state_dict()}
+        try:
+            limit = max(1, min(int(params.get("location_limit", 20)), 500))
+        except (TypeError, ValueError):
+            return {"success": False, "error": "location_limit must be an integer"}
+        state = self._state_dict()
+        state["location_history"] = load_location_reports(
+            limit=limit,
+            since=str(params.get("location_since") or ""),
+            until=str(params.get("location_until") or ""),
+            zone=str(params.get("location_zone") or ""),
+        )
+        return {"success": True, "state": state}
 
     def _state_dict(self) -> Dict[str, Any]:
         lock = getattr(self._runtime, "_state_lock", None)
@@ -73,9 +85,9 @@ class CommandRouter:
 
     def _handle_set_mode(self, params: Dict[str, Any]) -> Dict[str, Any]:
         mode = params.get("mode", "off")
-        if mode not in {"reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
+        if mode not in {"normal", "reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
             return {"success": False, "error": f"invalid mode: {mode}"}
-        self._runtime.set_mode(mode)
+        self._runtime.set_mode(mode, reason="manual")
         return {"success": True, "mode": mode, "state": self._state_dict()}
 
     def _handle_set_light(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -121,10 +133,39 @@ class CommandRouter:
         health = check_device_health(self._state, self._config)
         runtime = self._runtime.get_status()
         health["mqtt"]["connected"] = bool(runtime.get("mqtt_connected"))
-        health["sound_events"] = runtime.get(
-            "sound_events", {"enabled": False, "running": False}
-        )
+        health["vision"] = runtime.get("vision", {})
         return {"success": True, "health": health}
+
+    def _handle_vision_observe(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.vision_observe()
+
+    def _handle_vision_describe(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.vision_describe()
+
+    def _handle_vision_people(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.vision_people()
+
+    def _handle_vision_visitors(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.vision_visitors()
+
+    def _handle_vision_enroll_owner(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(params.get("name") or "").strip()
+        if not name:
+            return {"success": False, "error": "owner name is required"}
+        return self._runtime.vision_enroll_owner(name, float(params.get("seconds", 4)))
+
+    def _handle_vision_approve(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(params.get("name") or "").strip()
+        if not name:
+            return {"success": False, "error": "person name is required"}
+        return self._runtime.vision_approve(
+            int(params.get("sighting_id", 0)),
+            name,
+            owner=bool(params.get("owner", False)),
+        )
+
+    def _handle_vision_reject(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.vision_reject(int(params.get("sighting_id", 0)))
 
     def _handle_phone_location_changed(self, params: Dict[str, Any]) -> Dict[str, Any]:
         required = {"who", "transition", "zone", "at", "delivery_id", "source"}

@@ -23,7 +23,7 @@ from plugins.smart_room.runtime.app import Runtime
 from plugins.smart_room.runtime.models import MmWaveState, PhoneLocation, Presence, RoomState
 from plugins.smart_room.runtime.presence_fusion import fuse
 from plugins.smart_room.runtime.scheduler import Scheduler
-from plugins.smart_room.runtime.state_store import append_transition
+from plugins.smart_room.runtime.state_store import append_location_report, append_transition, load_location_reports
 from plugins.smart_room.runtime.state_store import save_state
 from plugins.smart_room.tools import handle_smart_room_state
 
@@ -82,7 +82,8 @@ def test_wifi_is_positive_only_identity_evidence():
         geofence_zone=None, exit_timeout_elapsed=False, wifi_detected=False,
     )
     assert presence.detected is True
-    assert presence.source == "ble_sticky_mmwave"
+    assert presence.source == "wifi_mmwave"
+    assert presence.identity_sticky is False
 
 
 def test_exit_timeout_uses_last_mmwave_occupancy_not_phone_sighting():
@@ -119,7 +120,35 @@ def test_he20_clear_event_is_delayed_and_edge_triggered(monkeypatch):
     assert emitted == [("presence_cleared", {"source": "mmwave"})]
 
 
-def test_welcome_requires_one_hour_empty(monkeypatch):
+def test_he20_single_occupied_pulse_does_not_create_room_entry(monkeypatch):
+    runtime = Runtime({"esp32": {"exit_timeout": 60}})
+    runtime._state.mmwave.occupied = False
+    runtime._room_clear_emitted = True
+    runtime._tuya = MagicMock()
+    runtime._tuya.get_light_status.return_value = {"success": True, "on": True, "brightness": 70}
+    runtime._tuya.get_mmwave_status.side_effect = [
+        {"success": True, "occupied": True},
+        {"success": True, "occupied": False},
+    ]
+    runtime._tuya.health.return_value = {}
+    runtime._mqtt = None
+    transition = MagicMock()
+    monkeypatch.setattr(runtime, "_probe_wifi_presence", lambda: False)
+    monkeypatch.setattr(runtime, "_handle_welcome_transition", transition)
+
+    runtime._poll_devices()
+    runtime._poll_devices()
+
+    transition.assert_not_called()
+    runtime._tuya.get_mmwave_status.side_effect = None
+    runtime._tuya.get_mmwave_status.return_value = {"success": True, "occupied": True}
+    runtime._poll_devices()
+    runtime._mmwave_occupied_since -= 4
+    runtime._poll_devices()
+    transition.assert_called_once_with(False, True)
+
+
+def test_entry_is_tracked_but_welcome_requires_one_hour_empty(monkeypatch):
     runtime = Runtime({
         "owner": "Shereef",
         "welcome": {"enabled": True, "reset_after_seconds": 3600, "identity_grace_seconds": 0},
@@ -128,40 +157,174 @@ def test_welcome_requires_one_hour_empty(monkeypatch):
     timer = MagicMock()
     monkeypatch.setattr(threading, "Timer", lambda *_args, **_kwargs: timer)
     runtime._handle_welcome_transition(False, True)
-    timer.start.assert_not_called()
+    timer.start.assert_called_once()
+    assert runtime._pending_entry_should_welcome is False
 
+    timer.reset_mock()
     runtime._state.room_empty_since = (datetime.now(timezone.utc) - timedelta(hours=1, seconds=1)).isoformat()
     runtime._handle_welcome_transition(False, True)
     timer.start.assert_called_once()
+    assert runtime._pending_entry_should_welcome is True
 
 
-def test_welcome_preview_uses_voice_instant_without_recording_arrival(monkeypatch):
-    import agent.auxiliary_client as auxiliary_client
-    import plugins.smart_room.runtime.app as app_module
-
-    calls = []
-    published = []
-    monkeypatch.setitem(
-        sys.modules,
-        "agent.prompt_builder",
-        SimpleNamespace(load_soul_md=lambda: ""),
-    )
-    monkeypatch.setattr(
-        auxiliary_client,
-        "call_llm",
-        lambda **kwargs: calls.append(kwargs) or SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="Welcome home, Shereef."))]
-        ),
-    )
-    monkeypatch.setattr(app_module, "publish_welcome", published.append)
+def test_welcome_preview_emits_structured_event_without_recording_arrival(monkeypatch):
     runtime = Runtime({"owner": "Shereef"})
     runtime._state.last_welcome_at = None
+    emitted = []
+    monkeypatch.setattr(runtime, "_emit_event", lambda event, data: emitted.append((event, data)))
 
     runtime._publish_welcome(True, "Shereef", record_arrival=False)
 
-    assert calls[0]["task"] == "voice_instant"
-    assert published == ["Welcome home, Shereef."]
+    assert emitted == [("room_welcome", {
+        "audience": "owner",
+        "owner_name": "Shereef",
+        "visitor_entries": [],
+        "message": "Welcome back, Shereef.",
+        "summary": "Smart Room welcome",
+    })]
     assert runtime._state.last_welcome_at is None
+
+
+def test_guest_welcome_is_structured_for_host_delivery(monkeypatch):
+    runtime = Runtime({"owner": "Shereef"})
+    emitted = []
+    monkeypatch.setattr(runtime, "_emit_event", lambda event, data: emitted.append((event, data)))
+
+    runtime._publish_welcome(False, "Shereef", record_arrival=False)
+
+    assert emitted[0][0] == "room_welcome"
+    assert emitted[0][1]["audience"] == "guest"
+    assert emitted[0][1]["message"] == "Welcome. Shereef isn't here right now."
+
+
+def test_recent_owntracks_home_arrival_identifies_owner_when_ble_sleeps(monkeypatch):
+    runtime = Runtime({"owner": "Shereef", "welcome": {"owner_evidence_window_seconds": 3600}})
+    runtime._state.mmwave.occupied = True
+    runtime._state.presence.detected = True
+    runtime._state.presence.source = "geofence_mmwave"
+    runtime._state.location.home = True
+    runtime._state.location.last_geofence_at = "2026-07-19T09:57:00+00:00"
+    runtime._ble_detected = False
+    runtime._pending_entry_at = "2026-07-19T10:00:00+00:00"
+    runtime._pending_entry_should_welcome = False
+    published = MagicMock()
+    emitted = MagicMock()
+    monkeypatch.setattr(runtime, "_publish_welcome", published)
+    monkeypatch.setattr(runtime, "_emit_event", emitted)
+
+    runtime._deliver_welcome()
+
+    published.assert_not_called()
+    assert runtime._state.unreported_visitor_entries == []
+    assert emitted.call_args.args[1]["classification"] == "owner"
+    assert emitted.call_args.args[1]["identity_reason"] == "owntracks_recent"
+
+
+def test_stale_home_phone_without_owner_evidence_is_still_a_guest(monkeypatch):
+    runtime = Runtime({"owner": "Shereef", "welcome": {"owner_evidence_window_seconds": 3600}})
+    runtime._state.mmwave.occupied = True
+    runtime._state.location.home = True
+    runtime._state.location.last_geofence_at = "2026-07-19T08:00:00+00:00"
+    runtime._pending_entry_at = "2026-07-19T10:00:00+00:00"
+    runtime._pending_entry_should_welcome = False
+    emitted = MagicMock()
+    monkeypatch.setattr(runtime, "_emit_event", emitted)
+
+    runtime._deliver_welcome()
+
+    assert runtime._state.unreported_visitor_entries[-1]["classification"] == "guest"
+    assert emitted.call_args.args[1]["identity_reason"] == "phone_home_without_recent_owner_evidence"
+
+
+def test_next_confirmed_owner_welcome_reports_and_clears_visitor_entries(monkeypatch):
+    runtime = Runtime({"owner": "Shereef"})
+    runtime._state.mmwave.occupied = True
+    runtime._state.location.home = True
+    runtime._state.unreported_visitor_entries = [{
+        "at": "2026-07-19T10:00:00+00:00",
+        "classification": "unknown_visitor",
+        "owner_phone_home": False,
+    }]
+    runtime._ble_detected = True
+    runtime._pending_entry_should_welcome = True
+    published = MagicMock()
+    monkeypatch.setattr(runtime, "_publish_welcome", published)
+    monkeypatch.setattr(runtime, "_emit_event", MagicMock())
+
+    runtime._deliver_welcome()
+
+    published.assert_called_once_with(
+        True,
+        "Shereef",
+        record_arrival=True,
+        visitor_entries=[{
+            "at": "2026-07-19T10:00:00+00:00",
+            "classification": "unknown_visitor",
+            "owner_phone_home": False,
+        }],
+    )
+    assert runtime._state.unreported_visitor_entries == []
+
+
+def test_confirmed_owner_reports_visitors_even_inside_welcome_cooldown(monkeypatch):
+    runtime = Runtime({"owner": "Shereef"})
+    runtime._state.mmwave.occupied = True
+    runtime._state.location.home = True
+    runtime._state.unreported_visitor_entries = [{
+        "at": "2026-07-19T10:00:00+00:00",
+        "classification": "unknown_visitor",
+        "owner_phone_home": False,
+    }]
+    runtime._ble_detected = True
+    runtime._pending_entry_should_welcome = False
+    emitted = []
+    monkeypatch.setattr(runtime, "_emit_event", lambda event, data: emitted.append((event, data)))
+    published = MagicMock()
+    monkeypatch.setattr(runtime, "_publish_welcome", published)
+
+    runtime._deliver_welcome()
+
+    published.assert_not_called()
+    report = next(data for event, data in emitted if event == "visitor_report")
+    assert "entered the room" in report["message"]
+    assert runtime._state.unreported_visitor_entries == []
+
+
+def test_owntracks_history_preserves_details_and_filters():
+    location = {
+        "_type": "location", "lat": 41.1, "lon": 29.2, "acc": 12,
+        "batt": 87, "inregions": ["Home"], "tst": 1784358126,
+    }
+    append_location_report("owntracks/smart_room/iphone", location)
+    duplicate = append_location_report("owntracks/smart_room/iphone", location)
+    append_location_report("owntracks/smart_room/iphone", {
+        "_type": "transition", "event": "leave", "desc": "Home", "tst": 1784359000,
+    })
+
+    reports = load_location_reports(limit=10, zone="home")
+
+    assert len(reports) == 2
+    assert duplicate["duplicate"] is True
+    assert reports[0]["latitude"] == 41.1
+    assert reports[0]["accuracy_m"] == 12
+    assert reports[0]["data"]["batt"] == 87
+    assert reports[1]["event"] == "leave"
+
+
+def test_owntracks_heartbeat_uses_phone_report_time_not_mqtt_delivery_time():
+    runtime = Runtime({"owner": "Shereef"})
+    runtime._state.location.home = True
+    runtime._state.location.zone = "home"
+    runtime._state.location.source = "owntracks"
+    reported = int(time.time()) - 120
+
+    runtime._on_owntracks("owntracks/smart_room/iphone", {
+        "_type": "location", "inregions": ["Home"], "tst": reported,
+    })
+    runtime._on_geofence("sync", "home")
+
+    stamp = datetime.fromisoformat(runtime._state.location.last_geofence_at)
+    assert int(stamp.timestamp()) == reported
 
 
 def test_location_event_is_idempotent_and_schedules_work_return(monkeypatch):
@@ -277,31 +440,20 @@ def test_plugin_registers_tools_lifecycle_and_context(monkeypatch):
     monkeypatch.setattr(plugin.platform, "system", lambda: "Windows")
     ctx = FakeContext()
     plugin.register(ctx)
-    assert len(ctx.tools) == 8
+    assert len(ctx.tools) == 10
     assert {name for name, _ in ctx.hooks} == {
         "on_gateway_start", "on_gateway_stop",
     }
     assert [name for name, _ in ctx.context] == ["smart_room"]
 
 
-def test_context_provider_host_contract():
-    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
-
-    manager = PluginManager()
-    context = PluginContext(PluginManifest(name="context-test"), manager)
-    context.register_context_provider("room", lambda: "Room: focus.")
-    assert manager.build_context_blocks() == ["Room: focus."]
-
-
 def test_context_line_is_config_gated_and_uses_fused_source():
     import yaml
-    from hermes_constants import get_hermes_home
+    from plugins.smart_room.runtime.paths import config_path
 
-    home = get_hermes_home()
-    home.mkdir(parents=True, exist_ok=True)
-    config_path = home / "config.yaml"
-    config_path.write_text(yaml.safe_dump({
-        "smart_room": {"enabled": True, "context": {"enabled": True}, "owner": "shereef"}
+    config_path().parent.mkdir(parents=True, exist_ok=True)
+    config_path().write_text(yaml.safe_dump({
+        "enabled": True, "context": {"enabled": True}, "owner": "shereef"
     }), encoding="utf-8")
     state = RoomState()
     state.presence = Presence(detected=True, source="ble_sticky_mmwave", confidence=0.6)
@@ -315,8 +467,8 @@ def test_context_line_is_config_gated_and_uses_fused_source():
     assert "Shereef present (ble_sticky_mmwave, conf 0.60)" in line
     assert "light 70% (reading) @3000K" in line
 
-    config_path.write_text(yaml.safe_dump({
-        "smart_room": {"enabled": True, "context": {"enabled": False}}
+    config_path().write_text(yaml.safe_dump({
+        "enabled": True, "context": {"enabled": False}
     }), encoding="utf-8")
     assert build_context_line() is None
 
@@ -367,23 +519,6 @@ def test_tuya_v35_bulb_uses_standard_hsv_dps(monkeypatch):
     assert Device.values == expected
 
 
-def test_subconscious_fetcher_baselines_then_returns_only_new_events():
-    from cron.scripts.subconscious.smart_room import fetch_delta
-    from cron.scripts.subconscious.snapshot_store import SurfaceStore
-
-    append_transition({"id": 1, "at": "2026-07-15T10:00:00Z", "type": "mode_changed", "summary": "focus mode"})
-    store = SurfaceStore("smart_room", min_interval_seconds=0)
-    assert fetch_delta(store) is None
-    store.save()
-
-    append_transition({"id": 2, "at": "2026-07-15T10:05:00Z", "type": "presence_detected", "summary": "owner arrived"})
-    store = SurfaceStore("smart_room", min_interval_seconds=0)
-    delta = fetch_delta(store)
-    assert delta is not None
-    assert "owner arrived" in delta
-    assert "focus mode" not in delta
-
-
 @pytest.mark.skipif(sys.platform != "win32", reason="Smart Room runtime is Windows-only")
 def test_runtime_crash_is_restarted_and_shutdown_is_clean():
     import yaml
@@ -395,12 +530,18 @@ def test_runtime_crash_is_restarted_and_shutdown_is_clean():
         yaml.safe_dump({"smart_room": {
             "enabled": True,
             "runtime": {"rpc_port": port},
+            "vision": {"enabled": False},
             "mqtt": {"broker": "127.0.0.1", "port": 1},
             "automations": {"evening_sleep": {"enabled": False}},
         }}),
         encoding="utf-8",
     )
-    config = {"enabled": True, "runtime": {"rpc_port": port}, "mqtt": {"port": 1}}
+    config = {
+        "enabled": True,
+        "runtime": {"rpc_port": port},
+        "mqtt": {"port": 1},
+        "vision": {"enabled": False},
+    }
     process_manager.stop_supervisor()
     try:
         started = process_manager.start_supervisor(config)

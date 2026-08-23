@@ -11,7 +11,7 @@ import importlib.util
 import os
 from typing import Any, Dict
 
-from plugins.smart_room.runtime.models import RoomState, now_iso
+from .models import RoomState, now_iso
 
 logger = logging.getLogger(__name__)
 

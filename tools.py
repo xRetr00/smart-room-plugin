@@ -2,12 +2,14 @@
 
 Tools:
   smart_room_state         — full room snapshot (presence, light, modes, devices)
-  smart_room_set_mode      — set mode: reading, focus, relax, night, sleep, alarm, off
+  smart_room_set_mode      — set mode: normal, reading, focus, relax, night, sleep, alarm, off
   smart_room_set_light     — direct light control (on/off, brightness, color)
   smart_room_cancel_sleep  — cancel sleep mode, restore previous state
   smart_room_override      — toggle manual override (disables presence automations)
   smart_room_health        — device health check (online/offline, last seen)
   smart_room_diagnostic    — full diagnostic dump for troubleshooting
+  smart_room_vision        — read current camera facts, known people, visitors
+  smart_room_vision_identity — enroll, approve, or reject a face identity
 
 All handlers are non-blocking: they call the runtime via the bridge and return
 structured JSON. If the runtime is down, they return DEVICE_TIMEOUT per v0.3.
@@ -18,7 +20,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
-from plugins.smart_room.bridge import call_runtime
+from .bridge import call_runtime
 
 
 # ---------------------------------------------------------------------------
@@ -31,7 +33,7 @@ def check_smart_room_requirements() -> bool:
     if _p.system().lower() != "windows":
         return False
     try:
-        from plugins.smart_room.runtime.state_store import load_config
+        from .runtime.state_store import load_config
 
         if not load_config().get("enabled", False):
             return False
@@ -50,10 +52,16 @@ SMART_ROOM_STATE_SCHEMA: Dict[str, Any] = {
         "Get the full smart room state snapshot: presence (BLE+mmWave+geofence "
         "fusion), light state (on/off, brightness, color, scene), active mode, "
         "device health (bulb, HE20 sensor, ESP32), phone location, and flags."
+        " Includes detailed timestamped OwnTracks history; use the location filters for past movements."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "location_limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 20},
+            "location_since": {"type": "string", "description": "Optional ISO timestamp lower bound."},
+            "location_until": {"type": "string", "description": "Optional ISO timestamp upper bound."},
+            "location_zone": {"type": "string", "description": "Optional exact geofence zone."},
+        },
         "additionalProperties": False,
     },
 }
@@ -62,7 +70,7 @@ SMART_ROOM_SET_MODE_SCHEMA: Dict[str, Any] = {
     "name": "smart_room_set_mode",
     "description": (
         "Set the smart room mode. Modes are mutually exclusive. "
-        "reading=warm 3000K 70%, focus=cool 5000K 100%, relax=warm amber 40%, night=dim warm 15%, "
+        "normal=white 4000K 70%, reading=warm 3000K 70%, focus=cool 5000K 100%, relax=warm amber 40%, night=dim warm 15%, "
         "sleep=lights off darkness enforced, alarm=flash bright white auto-expire, "
         "off=lights off no mode."
     ),
@@ -71,7 +79,7 @@ SMART_ROOM_SET_MODE_SCHEMA: Dict[str, Any] = {
         "properties": {
             "mode": {
                 "type": "string",
-                "enum": ["reading", "focus", "relax", "night", "sleep", "alarm", "off"],
+                "enum": ["normal", "reading", "focus", "relax", "night", "sleep", "alarm", "off"],
                 "description": "The mode to activate.",
             },
         },
@@ -152,6 +160,45 @@ SMART_ROOM_DIAGNOSTIC_SCHEMA: Dict[str, Any] = {
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }
 
+SMART_ROOM_VISION_SCHEMA: Dict[str, Any] = {
+    "name": "smart_room_vision",
+    "description": (
+        "Read Smart Room's always-on local vision state. Frames stay in the sidecar; "
+        "returns only structured observation, description, known people, or pending visitors."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["observe", "describe", "people", "visitors"],
+            },
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+}
+
+SMART_ROOM_VISION_IDENTITY_SCHEMA: Dict[str, Any] = {
+    "name": "smart_room_vision_identity",
+    "description": (
+        "Change the Smart Room face library. Enroll the visible owner, approve and name "
+        "a visitor sighting, or reject a visitor sighting."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["enroll_owner", "approve", "reject"]},
+            "name": {"type": "string"},
+            "sighting_id": {"type": "integer", "minimum": 1},
+            "owner": {"type": "boolean"},
+            "seconds": {"type": "number", "minimum": 1, "maximum": 20},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Handlers — all non-blocking via bridge.call_runtime()
@@ -167,14 +214,14 @@ def _err(msg: str, **extra) -> str:
 
 def handle_smart_room_state(args: Dict[str, Any], **_kw) -> str:
     try:
-        return _json(call_runtime("get_state", {}))
+        return _json(call_runtime("get_state", args))
     except RuntimeError as e:
         return _err(str(e), code="DEVICE_TIMEOUT")
 
 
 def handle_smart_room_set_mode(args: Dict[str, Any], **_kw) -> str:
     mode = (args.get("mode") or "").strip().lower()
-    if mode not in {"reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
+    if mode not in {"normal", "reading", "focus", "relax", "night", "sleep", "alarm", "off"}:
         return _err(f"invalid mode: {mode!r}")
     try:
         return _json(call_runtime("set_mode", {"mode": mode}))
@@ -242,6 +289,41 @@ def handle_smart_room_alarm(args: Dict[str, Any], **_kw) -> str:
     if not method:
         return _err("invalid alarm action")
     params = {key: value for key, value in args.items() if key != "action"}
+    try:
+        return _json(call_runtime(method, params))
+    except RuntimeError as e:
+        return _err(str(e), code="DEVICE_TIMEOUT")
+
+
+def handle_smart_room_vision(args: Dict[str, Any], **_kw) -> str:
+    method = {
+        "observe": "vision_observe",
+        "describe": "vision_describe",
+        "people": "vision_people",
+        "visitors": "vision_visitors",
+    }.get(str(args.get("action") or ""))
+    if not method:
+        return _err("invalid vision action")
+    try:
+        return _json(call_runtime(method, {}))
+    except RuntimeError as e:
+        return _err(str(e), code="DEVICE_TIMEOUT")
+
+
+def handle_smart_room_vision_identity(args: Dict[str, Any], **_kw) -> str:
+    action = str(args.get("action") or "")
+    method = {
+        "enroll_owner": "vision_enroll_owner",
+        "approve": "vision_approve",
+        "reject": "vision_reject",
+    }.get(action)
+    if not method:
+        return _err("invalid vision identity action")
+    params = {key: value for key, value in args.items() if key != "action"}
+    if action in {"enroll_owner", "approve"} and not str(params.get("name") or "").strip():
+        return _err("name is required")
+    if action in {"approve", "reject"} and int(params.get("sighting_id") or 0) <= 0:
+        return _err("sighting_id must be positive")
     try:
         return _json(call_runtime(method, params))
     except RuntimeError as e:

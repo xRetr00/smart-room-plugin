@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
-from plugins.smart_room.runtime.models import RoomState, now_iso
+from .models import RoomState, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +51,18 @@ def evaluate_automations(
 
     # Don't run presence-based automations in sleep/alarm mode or with override
     suppress_on = state.modes.active_mode in {"sleep", "alarm"} or state.modes.manual_override == "hold_off"
-    suppress_off = state.modes.active_mode in {"sleep", "alarm"} or state.modes.manual_override == "hold_on"
+    suppress_off = state.modes.active_mode in {"focus", "sleep", "alarm"} or state.modes.manual_override == "hold_on"
+
+    adaptive = auto_cfg.get("adaptive_light", {})
 
     # --- 4.1 Adaptive Light On ---
-    if auto_cfg.get("adaptive_light", {}).get("enabled", True):
+    if adaptive.get("enabled", True):
         if event_type == "presence_detected" and not suppress_on:
             actions.append(Action(type="turn_on", params={"restore_scene": True}))
 
     # --- 4.2 Light Off After Clear ---
-    if auto_cfg.get("adaptive_light", {}).get("enabled", True):
+    # Fail safe: absence is sensor-derived, so auto-off requires explicit opt-in.
+    if adaptive.get("enabled", True) and adaptive.get("auto_off", False):
         if event_type == "presence_cleared" and not suppress_off:
             actions.append(Action(type="turn_off", params={}))
 

@@ -18,7 +18,7 @@ import uuid
 from typing import Any, Dict, Optional
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from .runtime.paths import rpc_token_path, smart_room_home
 
 
 # Socket path for JSON-RPC communication with the runtime child process.
@@ -31,13 +31,19 @@ _TIMEOUT_SECONDS = 8.0  # includes bounded scene fades and device retries
 
 def _state_file() -> Path:
     """Runtime state snapshot file path."""
-    return Path(get_hermes_home()) / "smart_room" / "state.json"
+    return smart_room_home() / "state.json"
 
 
 def _rpc_port() -> int:
-    """Resolve the internal RPC port from the runtime's config."""
+    """Resolve the port recorded by the running sidecar, then local config."""
     try:
-        from plugins.smart_room.runtime.state_store import load_config
+        active = json.loads((smart_room_home() / ".runtime.json").read_text(encoding="utf-8"))
+        if active.get("rpc_port") is not None:
+            return int(active["rpc_port"])
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        from .runtime.state_store import load_config
 
         return int((load_config().get("runtime") or {}).get("rpc_port", _DEFAULT_PORT))
     except Exception:
@@ -45,7 +51,7 @@ def _rpc_port() -> int:
 
 
 def _rpc_token() -> str:
-    path = Path(get_hermes_home()) / "smart_room" / ".rpc-token"
+    path = rpc_token_path()
     try:
         token = path.read_text(encoding="utf-8").strip()
     except OSError as exc:
@@ -128,7 +134,7 @@ def build_context_line() -> Optional[str]:
     Returns None if no state is available (plugin not configured yet).
     """
     try:
-        from plugins.smart_room.runtime.state_store import load_config
+        from .runtime.state_store import load_config
 
         config = load_config()
         if not config.get("enabled", False) or not (config.get("context") or {}).get("enabled", True):
@@ -156,6 +162,20 @@ def build_context_line() -> Optional[str]:
         parts.append("phone: home")
     elif loc.get("zone") not in {None, "", "unknown"}:
         parts.append(f"phone: {loc['zone']}")
+    try:
+        from .runtime.state_store import load_location_reports
+
+        latest = load_location_reports(limit=1)
+        if latest:
+            report = latest[-1]
+            detail = f"OwnTracks {report.get('reported_at')}"
+            if report.get("latitude") is not None and report.get("longitude") is not None:
+                detail += f" ({report['latitude']}, {report['longitude']} ±{report.get('accuracy_m', '?')}m)"
+            if report.get("event"):
+                detail += f" {report['event']} {report.get('zone') or 'unknown'}"
+            parts.append(detail)
+    except Exception:
+        pass
 
     # Light
     light = state.get("light", {})
@@ -176,6 +196,33 @@ def build_context_line() -> Optional[str]:
     active_alarm = state.get("active_alarm")
     if isinstance(active_alarm, dict):
         parts.append(f"active alarm: {active_alarm.get('name', 'Alarm')} ({active_alarm.get('phase', 'active')})")
+    visitor_entries = state.get("unreported_visitor_entries") or []
+    if visitor_entries:
+        latest = visitor_entries[-1]
+        parts.append(
+            f"{len(visitor_entries)} unreported visitor entry/entries; "
+            f"latest {latest.get('classification', 'visitor')} at {latest.get('at', 'unknown time')}"
+        )
+
+    vision = state.get("vision") or {}
+    if vision.get("enabled"):
+        if vision.get("camera_open") and not vision.get("stale"):
+            seen = int(vision.get("person_count") or 0)
+            vision_parts = [f"vision: {seen} visible"]
+            if vision.get("owner_visible"):
+                vision_parts.append("owner visible")
+            if vision.get("activity") not in {None, "", "unknown"}:
+                vision_parts.append(str(vision["activity"]))
+            if vision.get("gesture"):
+                vision_parts.append(f"gesture {vision['gesture']}")
+            if vision.get("sleep_state") not in {None, "", "unknown"}:
+                vision_parts.append(str(vision["sleep_state"]))
+            pending = int(vision.get("pending_visitors") or 0)
+            if pending:
+                vision_parts.append(f"{pending} pending visitor(s)")
+            parts.append("; ".join(vision_parts))
+        else:
+            parts.append("vision unavailable")
 
     if not parts:
         return None
