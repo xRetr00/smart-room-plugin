@@ -6,10 +6,21 @@ kind: backend
 platforms:
   - windows
 pip_dependencies:
+  # Vision.
   - insightface>=0.7,<1
   - onnxruntime>=1.17,<2
   - opencv-python-headless>=4.10,<5
   - mediapipe>=0.10,<1
+  # Devices and messaging. The health check reports on both of these and the
+  # manifest declared neither, so they were never installed: every Tuya call
+  # failed, MQTT was off, and the runtime log said "Tuya control disabled" on
+  # every start while the room showed eleven thousand failed attempts.
+  - tinytuya>=1.13,<2
+  - paho-mqtt>=2,<3
+  # Read at startup, before anything else can work: config.yaml and the device
+  # credentials in secrets.env.
+  - PyYAML>=6,<7
+  - python-dotenv>=1,<2
 provides_tools:
   - smart_room_state
   - smart_room_set_mode
