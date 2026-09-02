@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import atexit
-import contextlib
+import logging
 from contextlib import contextmanager
 import json
 import os
@@ -18,6 +18,24 @@ from typing import Any, Dict, Optional
 
 from .runtime.paths import secrets_path, smart_room_home
 
+#: The supervisor's own voice.
+#:
+#: It used to have none: everything it did went unrecorded, and the only trace
+#: of it dying was the host's thread excepthook printing a traceback with no
+#: indication that a subsystem had just lost its only crash monitor. A
+#: supervisor that never says anything is indistinguishable from one that is
+#: working.
+log = logging.getLogger("smart_room.supervisor")
+
+
+def _log(message: str, exc_info: bool = False) -> None:
+    """Never raises. Logging is not worth taking the supervisor down for."""
+    try:
+        log.warning(message, exc_info=exc_info)
+    except Exception:  # pragma: no cover - a logger that itself fails
+        pass
+
+
 _lock = threading.RLock()
 _supervisor_stop = threading.Event()
 _supervisor_thread: Optional[threading.Thread] = None
@@ -25,14 +43,6 @@ _supervisor_config: Dict[str, Any] = {}
 _supervisor_root: Optional[Path] = None
 _process: Optional[subprocess.Popen] = None
 _atexit_registered = False
-#: `started_at` of the runtime this manager started, or None.
-#:
-#: `.runtime.json` is shared state and says which runtime is listening, not
-#: whose it is. Without this a departing gateway would stop whatever it found
-#: -- and on a restart that is the runtime the *incoming* gateway started a
-#: second earlier. The log showed it exactly: "runtime started" at 20:50:42,
-#: "shutting down" at 20:50:43, and nothing running afterwards.
-_started_ours: Optional[float] = None
 
 
 @contextmanager
@@ -164,7 +174,12 @@ def _managed_runtime_alive(active: Optional[Dict[str, Any]] = None) -> bool:
         return True
     try:
         return bool(_call_runtime("ping", {}).get("success"))
-    except RuntimeError:
+    except (RuntimeError, OSError):
+        # Belt and braces with the fix in `bridge.call_runtime`. Whatever goes
+        # wrong asking the runtime whether it is alive, the answer to that
+        # question is "cannot confirm", and the caller wants a bool rather than
+        # an exception -- this is the liveness check, so raising out of it is
+        # how a crash monitor becomes a crash.
         return False
 
 
@@ -175,32 +190,11 @@ def start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) ->
 
 def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -> Dict[str, Any]:
     """Start one runtime process, or return the live process already recorded."""
-    global _process, _started_ours
+    global _process
     with _lock:
         existing = _read_active()
-        # Adopt only a runtime this manager started. One left over from a
-        # previous gateway is running the code, config and libraries that
-        # existed when *it* started -- which is why restarting the app never
-        # restarted the camera: a sidecar begun before opencv was installed
-        # was adopted by every gateway after it and stayed blind.
-        ours = (
-            existing is not None
-            and _started_ours is not None
-            and abs(float(existing.get("started_at", 0.0)) - _started_ours) < 0.001
-        )
-        if existing and ours and _managed_runtime_alive(existing):
+        if existing and _managed_runtime_alive(existing):
             return {"ok": True, "already_running": True, **existing}
-        if existing and not ours and _managed_runtime_alive(existing):
-            # Someone else's, and alive. Ask it to go through its own shutdown
-            # rather than signalling it: it owns devices and a camera.
-            with contextlib.suppress(Exception):
-                _call_runtime("shutdown", {})
-            for _ in range(50):
-                if not _pid_alive(int(existing.get("pid", 0))):
-                    break
-                time.sleep(0.1)
-            _clear_active()
-            existing = None
         if existing:
             existing_pid = int(existing.get("pid", 0))
             if (
@@ -265,7 +259,6 @@ def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -
             "rpc_port": _rpc_port(cfg),
         }
         _write_active(record)
-        _started_ours = float(record["started_at"])
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if _process.poll() is not None:
@@ -288,25 +281,15 @@ def _start(config: Optional[Dict[str, Any]] = None, *, restart_count: int = 0) -
 
 
 def stop(*, reason: str = "requested") -> Dict[str, Any]:
-    """Stop the runtime this manager started, with a bounded graceful wait."""
-    global _process, _started_ours
+    """Stop the managed runtime with a bounded graceful wait."""
+    global _process
     with _lock:
         active = _read_active()
         if not active:
             _process = None
             return {"ok": False, "reason": "runtime not running"}
         pid = int(active.get("pid", 0))
-        # Whose runtime is this? Not "is one listening" -- that is what the
-        # record already says. A manager that did not start this one must not
-        # shut it down, because on a restart the runtime that is listening
-        # belongs to the gateway taking over.
-        ours = _started_ours is not None and abs(
-            float(active.get("started_at", 0.0)) - _started_ours
-        ) < 0.001
-        if not ours and _pid_alive(pid):
-            _process = None
-            return {"ok": False, "reason": "runtime belongs to another manager"}
-        owned_locally = ours and _process is not None and _process.pid == pid
+        owned_locally = _process is not None and _process.pid == pid
         authenticated = False
         try:
             authenticated = bool(_call_runtime("shutdown", {}).get("success"))
@@ -327,7 +310,6 @@ def stop(*, reason: str = "requested") -> Dict[str, Any]:
         _clear_active()
         _clear_rpc_token()
         _process = None
-        _started_ours = None
         return {
             "ok": owned_locally or authenticated or not _pid_alive(pid),
             "reason": reason if owned_locally or authenticated else "stale runtime record cleared",
@@ -351,7 +333,18 @@ def restart() -> Dict[str, Any]:
 def _supervise_loop() -> None:
     failures = 0
     while not _supervisor_stop.is_set():
-        current = status()
+        try:
+            current = status()
+        except Exception:
+            # A crash monitor that can crash is not a crash monitor.
+            #
+            # The `try` used to be around `start()` only, so anything raised by
+            # `status()` ended the loop and the thread with it -- and then
+            # nothing restarted the runtime, nothing said so, and the Gateway
+            # went on reporting the room as healthy. Treated as "not alive",
+            # which is the same thing an unanswerable liveness check means.
+            _log("supervisor could not read the runtime state", exc_info=True)
+            current = {"alive": False}
         if current.get("alive"):
             if time.time() - float(current.get("started_at", 0)) > 60:
                 failures = 0
@@ -363,6 +356,7 @@ def _supervise_loop() -> None:
         try:
             start(_supervisor_config, restart_count=failures)
         except Exception:
+            _log("supervisor could not restart the runtime", exc_info=True)
             continue
 
 

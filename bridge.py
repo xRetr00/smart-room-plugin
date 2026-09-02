@@ -106,7 +106,19 @@ def call_runtime(method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if "error" in response:
             raise RuntimeError(response["error"])
         return response.get("result", {})
-    except (json.JSONDecodeError, socket.timeout) as e:
+    except (json.JSONDecodeError, OSError) as e:
+        # `OSError`, not `socket.timeout`.
+        #
+        # The connect block above already catches OSError; this one caught only
+        # a timeout, so a connection reset mid-call -- the runtime exiting
+        # while we are reading its answer, WinError 10054 -- escaped as a bare
+        # OSError. Every caller here is written to expect RuntimeError, so it
+        # went past `_managed_runtime_alive`'s handler, past `status()`, and
+        # killed the supervisor thread that is the only thing that restarts the
+        # runtime. Twice, in one day's Gateway log.
+        #
+        # `socket.timeout` is an alias of `TimeoutError`, which is an OSError,
+        # so this is strictly wider and loses nothing.
         raise RuntimeError(f"runtime communication error: {e}") from e
     finally:
         sock.close()
