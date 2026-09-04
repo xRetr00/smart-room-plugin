@@ -185,6 +185,9 @@ class Runtime:
                 self._publish_vision_state,
                 self._emit_event,
             )
+            # Repair libraries created by the old review flow, which could
+            # demote the configured owner while adding another face sample.
+            self._vision.library.set_owner(self._owner_name)
             self._vision.start()
         except Exception as exc:
             logger.warning("Vision worker init failed (non-fatal): %s", exc, exc_info=True)
@@ -1375,6 +1378,16 @@ class Runtime:
         if not self._vision:
             return {"success": False, "error": "vision worker is unavailable"}
         return self._vision.reject(sighting_id)
+
+    def vision_reject_all(self) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.reject_all()
+
+    def vision_set_owner(self, name: str) -> Dict[str, Any]:
+        if not self._vision:
+            return {"success": False, "error": "vision worker is unavailable"}
+        return self._vision.set_owner(name)
 
     def run_diagnostic(self) -> Dict[str, Any]:
         from .command_router import _redact_config

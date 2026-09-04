@@ -8,6 +8,9 @@
 - **Tuya LAN control**: Direct control of RGBCW bulb + HE20 sensor via tinytuya — no cloud
 - **Room automations**: Adaptive light, sleep/alarm behavior, work-return settle/cancel, evening sleep, and daily resets
 - **Sound controls**: Plugin-local quantized YAMNet detection — double clap toggles the light; triple clap enters Sleep; a lone clap is ignored
+- **Local vision**: InsightFace identity matching with quality-gated enrollment,
+  a bounded visitor-review queue, nearest-known suggestions, and automatic
+  thumbnail cleanup; raw camera frames never leave the sidecar
 - **World-awareness**: Marvi knows where you are, what mode the room is in, light state — as ambient context, not memory writes
 - **Marvi integration**: Plugin tools (`smart_room_state`, `smart_room_set_mode`, etc.) + session context line + subconscious transitions
 
@@ -87,6 +90,8 @@ python plugins/smart_room/scripts/create_owntracks_config.py `
 | `smart_room_health` | Device health check |
 | `smart_room_diagnostic` | Full diagnostic dump |
 | `smart_room_alarm` | Create/update/list/delete one-day or daily alarms; acknowledge active alarm |
+| `smart_room_vision` | Read bounded camera, identity, gesture, and visitor facts |
+| `smart_room_vision_identity` | Enroll or select the owner; approve, reject, or bulk-reject face sightings |
 
 ## Spec
 See `D:\hermes-agent\docs\superpowers\specs\2026-07-14-marvi-smart-room-plugin-v0.3.md` for the current v0.4 revision (the original path is retained for existing links).

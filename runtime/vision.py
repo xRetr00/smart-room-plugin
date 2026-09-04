@@ -81,15 +81,29 @@ def cosine(left: list[float], right: list[float]) -> float:
 class FaceLibrary:
     """Sidecar-owned identity and visitor database."""
 
-    def __init__(self, directory: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        directory: Optional[Path] = None,
+        *,
+        owner_threshold: float = OWNER_THRESHOLD,
+        known_threshold: float = KNOWN_THRESHOLD,
+        pending_similarity: float = PENDING_SIMILARITY,
+        max_pending: int = MAX_PENDING,
+    ) -> None:
         self.dir = directory or vision_home()
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / "faces").mkdir(exist_ok=True)
+        self.owner_threshold = float(owner_threshold)
+        self.known_threshold = float(known_threshold)
+        self.pending_similarity = float(pending_similarity)
+        self.max_pending = max(1, min(int(max_pending), 200))
         self._lock = threading.RLock()
         self._db = sqlite3.connect(self.dir / "faces.sqlite3", check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
         self._db.commit()
+        self._enforce_pending_limit()
+        self._cleanup_orphan_thumbnails()
 
     def close(self) -> None:
         with self._lock:
@@ -104,25 +118,28 @@ class FaceLibrary:
         with self._lock:
             if owner:
                 self._db.execute("UPDATE people SET owner = 0")
-            row = self._db.execute("SELECT id FROM people WHERE name = ?", (clean,)).fetchone()
+            row = self._db.execute("SELECT id, owner FROM people WHERE name = ?", (clean,)).fetchone()
             if row:
                 person_id = int(row["id"])
-                self._db.execute(
-                    "UPDATE people SET owner = ? WHERE id = ?",
-                    (1 if owner else 0, person_id),
-                )
+                # Adding an ordinary sample to the owner's existing identity
+                # must never demote them. Ownership changes only through an
+                # explicit owner action.
+                if owner:
+                    self._db.execute("UPDATE people SET owner = 1 WHERE id = ?", (person_id,))
+                is_owner = owner or bool(row["owner"])
             else:
                 cursor = self._db.execute(
                     "INSERT INTO people (name, owner, at) VALUES (?, ?, ?)",
                     (clean, 1 if owner else 0, _now_iso()),
                 )
                 person_id = int(cursor.lastrowid or 0)
+                is_owner = owner
             self._db.executemany(
                 "INSERT INTO embeddings (person_id, vector) VALUES (?, ?)",
                 [(person_id, json.dumps(list(map(float, item)))) for item in embeddings],
             )
             self._db.commit()
-        return {"name": clean, "owner": owner, "samples": len(embeddings)}
+        return {"name": clean, "owner": is_owner, "samples": len(embeddings)}
 
     def people(self) -> list[Dict[str, Any]]:
         with self._lock:
@@ -141,6 +158,21 @@ class FaceLibrary:
             row = self._db.execute("SELECT name FROM people WHERE owner = 1 LIMIT 1").fetchone()
         return str(row["name"]) if row else None
 
+    def set_owner(self, name: str) -> bool:
+        clean = name.strip()[:80]
+        if not clean:
+            return False
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id FROM people WHERE name = ? COLLATE NOCASE", (clean,)
+            ).fetchone()
+            if row is None:
+                return False
+            self._db.execute("UPDATE people SET owner = 0")
+            self._db.execute("UPDATE people SET owner = 1 WHERE id = ?", (int(row["id"]),))
+            self._db.commit()
+        return True
+
     def match(self, embedding: list[float]) -> Dict[str, Any]:
         with self._lock:
             rows = self._db.execute(
@@ -152,11 +184,12 @@ class FaceLibrary:
             score = cosine(embedding, json.loads(row["vector"]))
             if score > best_score:
                 best_name, best_score, best_owner = str(row["name"]), score, bool(row["owner"])
-        if best_owner and best_score >= OWNER_THRESHOLD:
-            return {"identity": best_name, "status": "owner", "score": round(best_score, 4)}
-        if best_name and best_score >= KNOWN_THRESHOLD:
-            return {"identity": best_name, "status": "known", "score": round(best_score, 4)}
-        return {"identity": "unknown", "status": "unknown", "score": round(best_score, 4)}
+        nearest = {"name": best_name, "score": round(best_score, 4)} if best_name else {}
+        if best_owner and best_score >= self.owner_threshold:
+            return {"identity": best_name, "status": "owner", "score": round(best_score, 4), "nearest": nearest}
+        if best_name and best_score >= self.known_threshold:
+            return {"identity": best_name, "status": "known", "score": round(best_score, 4), "nearest": nearest}
+        return {"identity": "unknown", "status": "unknown", "score": round(best_score, 4), "nearest": nearest}
 
     def record_sighting(
         self,
@@ -171,9 +204,9 @@ class FaceLibrary:
                 rows = self._db.execute(
                     "SELECT vector FROM sightings WHERE status = 'unknown' AND reported = 0 "
                     "AND vector IS NOT NULL ORDER BY id DESC LIMIT ?",
-                    (MAX_PENDING,),
+                    (self.max_pending,),
                 ).fetchall()
-                if any(cosine(embedding, json.loads(row["vector"])) >= PENDING_SIMILARITY for row in rows):
+                if any(cosine(embedding, json.loads(row["vector"])) >= self.pending_similarity for row in rows):
                     return None
             cursor = self._db.execute(
                 "INSERT INTO sightings (at, identity, status, score, thumbnail, reported, vector) "
@@ -184,22 +217,42 @@ class FaceLibrary:
                     json.dumps(embedding) if embedding is not None else None,
                 ),
             )
+            removed = self._db.execute(
+                "SELECT thumbnail FROM sightings WHERE status = 'unknown' AND reported = 0 "
+                "AND id NOT IN (SELECT id FROM sightings WHERE status = 'unknown' AND reported = 0 "
+                "ORDER BY id DESC LIMIT ?)",
+                (self.max_pending,),
+            ).fetchall()
             self._db.execute(
                 "DELETE FROM sightings WHERE status = 'unknown' AND reported = 0 AND id NOT IN "
                 "(SELECT id FROM sightings WHERE status = 'unknown' AND reported = 0 "
                 "ORDER BY id DESC LIMIT ?)",
-                (MAX_PENDING,),
+                (self.max_pending,),
             )
             self._db.commit()
-            return int(cursor.lastrowid or 0)
+            sighting_id = int(cursor.lastrowid or 0)
+        self._remove_thumbnails([row["thumbnail"] for row in removed])
+        return sighting_id
 
     def unreported_visitors(self) -> list[Dict[str, Any]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT id, at, identity, score, thumbnail FROM sightings "
+                "SELECT id, at, identity, score, thumbnail, vector FROM sightings "
                 "WHERE status = 'unknown' AND reported = 0 ORDER BY id"
             ).fetchall()
-        return [dict(row) for row in rows]
+        visitors = []
+        for row in rows:
+            item = dict(row)
+            vector = item.pop("vector", None)
+            nearest: Dict[str, Any] = {}
+            if vector:
+                try:
+                    nearest = self.match(json.loads(vector)).get("nearest") or {}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    nearest = {}
+            item["nearest"] = nearest
+            visitors.append(item)
+        return visitors
 
     def recent_sightings(self, limit: int = 30) -> list[Dict[str, Any]]:
         with self._lock:
@@ -232,16 +285,79 @@ class FaceLibrary:
         with self._lock:
             self._db.execute(
                 "UPDATE sightings SET identity = ?, status = ?, reported = 1 WHERE id = ?",
-                (name.strip()[:80], "owner" if owner else "known", sighting_id),
+                (name.strip()[:80], "owner" if result["owner"] else "known", sighting_id),
             )
             self._db.commit()
         return result
 
     def reject(self, sighting_id: int) -> bool:
         with self._lock:
+            row = self._db.execute("SELECT thumbnail FROM sightings WHERE id = ?", (sighting_id,)).fetchone()
             cursor = self._db.execute("DELETE FROM sightings WHERE id = ?", (sighting_id,))
             self._db.commit()
-            return cursor.rowcount > 0
+            removed = cursor.rowcount > 0
+        if removed and row is not None:
+            self._remove_thumbnails([row["thumbnail"]])
+        return removed
+
+    def reject_all(self) -> int:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT thumbnail FROM sightings WHERE status = 'unknown' AND reported = 0"
+            ).fetchall()
+            cursor = self._db.execute(
+                "DELETE FROM sightings WHERE status = 'unknown' AND reported = 0"
+            )
+            self._db.commit()
+            removed = max(0, int(cursor.rowcount))
+        self._remove_thumbnails([row["thumbnail"] for row in rows])
+        return removed
+
+    def _remove_thumbnails(self, paths: list[Any]) -> None:
+        faces_dir = (self.dir / "faces").resolve()
+        for value in paths:
+            if not value:
+                continue
+            path = Path(str(value))
+            try:
+                resolved = path.resolve()
+                if resolved.parent == faces_dir:
+                    resolved.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Could not remove face thumbnail %s", path, exc_info=True)
+
+    def _enforce_pending_limit(self) -> None:
+        with self._lock:
+            removed = self._db.execute(
+                "SELECT thumbnail FROM sightings WHERE status = 'unknown' AND reported = 0 "
+                "AND id NOT IN (SELECT id FROM sightings WHERE status = 'unknown' AND reported = 0 "
+                "ORDER BY id DESC LIMIT ?)",
+                (self.max_pending,),
+            ).fetchall()
+            self._db.execute(
+                "DELETE FROM sightings WHERE status = 'unknown' AND reported = 0 AND id NOT IN "
+                "(SELECT id FROM sightings WHERE status = 'unknown' AND reported = 0 "
+                "ORDER BY id DESC LIMIT ?)",
+                (self.max_pending,),
+            )
+            self._db.commit()
+        self._remove_thumbnails([row["thumbnail"] for row in removed])
+
+    def _cleanup_orphan_thumbnails(self) -> None:
+        with self._lock:
+            referenced = {
+                str(Path(str(row["thumbnail"])).resolve())
+                for row in self._db.execute(
+                    "SELECT thumbnail FROM sightings WHERE thumbnail IS NOT NULL"
+                ).fetchall()
+                if row["thumbnail"]
+            }
+        for path in (self.dir / "faces").glob("*.jpg"):
+            if str(path.resolve()) not in referenced:
+                try:
+                    path.unlink()
+                except OSError:
+                    logger.debug("Could not remove orphan face thumbnail %s", path, exc_info=True)
 
 
 def _download(url: str, destination: Path) -> Path:
@@ -327,6 +443,7 @@ class LocalVisionAnalyzer:
             {
                 "embedding": [float(value) for value in face.normed_embedding],
                 "bbox": [float(value) for value in face.bbox],
+                "detection_score": float(face.det_score),
             }
             for face in self._face.get(frame)
         ]
@@ -393,7 +510,14 @@ class VisionWorker:
         self.config = config
         self.publish_state = publish_state
         self.emit_event = emit_event
-        self.library = library or FaceLibrary()
+        face_config = config.get("faces") if isinstance(config.get("faces"), dict) else {}
+        match_threshold = float(face_config.get("match_threshold", KNOWN_THRESHOLD))
+        self.library = library or FaceLibrary(
+            owner_threshold=float(face_config.get("owner_match_threshold", match_threshold)),
+            known_threshold=match_threshold,
+            pending_similarity=float(face_config.get("pending_similarity", PENDING_SIMILARITY)),
+            max_pending=int(face_config.get("max_pending", MAX_PENDING)),
+        )
         self.analyzer = analyzer or LocalVisionAnalyzer(
             auto_download=bool(config.get("auto_download_models", True))
         )
@@ -468,6 +592,13 @@ class VisionWorker:
 
     def reject(self, sighting_id: int) -> Dict[str, Any]:
         return {"success": self.library.reject(sighting_id), "sighting_id": sighting_id}
+
+    def reject_all(self) -> Dict[str, Any]:
+        return {"success": True, "rejected": self.library.reject_all()}
+
+    def set_owner(self, name: str) -> Dict[str, Any]:
+        changed = self.library.set_owner(name)
+        return {"success": changed, "name": name, **({} if changed else {"error": f"unknown person: {name}"})}
 
     def enroll_owner(self, name: str, seconds: float = 4.0) -> Dict[str, Any]:
         deadline = time.monotonic() + max(1.0, min(float(seconds), 20.0))
@@ -553,16 +684,59 @@ class VisionWorker:
         except Exception:
             return None
 
+    def _reviewable_face(self, frame: Any, face: Dict[str, Any]) -> bool:
+        """Keep partial, tiny, low-confidence and blurred faces out of review."""
+        settings = self.config.get("faces") if isinstance(self.config.get("faces"), dict) else {}
+        try:
+            score = float(face.get("detection_score", 1.0))
+            box = [float(value) for value in face.get("bbox") or []]
+        except (TypeError, ValueError):
+            return False
+        if score < float(settings.get("min_detection_confidence", 0.65)):
+            return False
+        if len(box) < 4:
+            return frame is None
+        x1, y1, x2, y2 = box[:4]
+        width, height = x2 - x1, y2 - y1
+        minimum = float(settings.get("min_face_size", 80))
+        if width < minimum or height < minimum or width <= 0 or height <= 0:
+            return False
+        ratio = width / height
+        if ratio < 0.55 or ratio > 1.45:
+            return False
+        if frame is None or not hasattr(frame, "shape"):
+            return True
+        frame_height, frame_width = frame.shape[:2]
+        edge = float(settings.get("edge_margin_ratio", 0.015))
+        if x1 <= frame_width * edge or y1 <= frame_height * edge or x2 >= frame_width * (1 - edge) or y2 >= frame_height * (1 - edge):
+            return False
+        blur_floor = float(settings.get("min_blur_variance", 35.0))
+        if blur_floor <= 0:
+            return True
+        try:
+            import cv2
+            crop = frame[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)]
+            if crop.size == 0:
+                return False
+            grey = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            return float(cv2.Laplacian(grey, cv2.CV_64F).var()) >= blur_floor
+        except Exception:
+            return False
+
     def _apply_analysis(self, frame: Any, analysis: Dict[str, Any], *, moving: bool) -> None:
         identities: list[str] = []
         owner_visible = False
         owner_confidence = 0.0
         embeddings: list[list[float]] = []
+        reviewable_embeddings: list[list[float]] = []
         for face in analysis.get("faces") or []:
             embedding = [float(value) for value in face.get("embedding") or []]
             if not embedding:
                 continue
             embeddings.append(embedding)
+            reviewable = self._reviewable_face(frame, face)
+            if reviewable:
+                reviewable_embeddings.append(embedding)
             verdict = self.library.match(embedding)
             identities.append(str(verdict["identity"]))
             if verdict["status"] == "owner":
@@ -573,7 +747,7 @@ class VisionWorker:
             # that decision, avoiding a JPEG and database row every second for
             # the owner sitting at their desk.
             sighting_id = None
-            if verdict["status"] == "unknown":
+            if verdict["status"] == "unknown" and reviewable:
                 sighting_id = self.library.record_sighting(
                     str(verdict["identity"]),
                     str(verdict["status"]),
@@ -613,7 +787,7 @@ class VisionWorker:
         person_count = max(int(analysis.get("person_count") or 0), len(embeddings))
         with self._lock:
             previous_sleep = self.state.sleep_state
-            self._latest_embeddings = embeddings
+            self._latest_embeddings = reviewable_embeddings
             self.state.last_inference_at = _now_iso()
             self.state.person_count = person_count
             self.state.owner_visible = owner_visible

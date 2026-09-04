@@ -1,5 +1,5 @@
 name: smart_room
-version: 0.7.0
+version: 0.7.1
 description: "Independent smart room sidecar for Marvi — room control, presence fusion, and single-owner local vision. Native Windows, no Docker/WSL."
 author: xRetro Labs
 kind: backend

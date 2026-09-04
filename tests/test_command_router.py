@@ -36,6 +36,8 @@ class TestCommandRouter:
         self.runtime.vision_enroll_owner = MagicMock(return_value={"success": True, "name": "Retro"})
         self.runtime.vision_approve = MagicMock(return_value={"success": True, "name": "Guest"})
         self.runtime.vision_reject = MagicMock(return_value={"success": True, "sighting_id": 7})
+        self.runtime.vision_reject_all = MagicMock(return_value={"success": True, "rejected": 4})
+        self.runtime.vision_set_owner = MagicMock(return_value={"success": True, "name": "Retro"})
         self.runtime.get_status = MagicMock(
             return_value={
                 "running": True,
@@ -113,8 +115,12 @@ class TestCommandRouter:
             "vision_approve", {"sighting_id": 7, "name": "Guest", "owner": False}
         )
         rejected = self.router.dispatch("vision_reject", {"sighting_id": 7})
+        rejected_all = self.router.dispatch("vision_reject_all", {})
+        owner = self.router.dispatch("vision_set_owner", {"name": "Retro"})
 
         assert enrolled["name"] == "Retro"
         self.runtime.vision_enroll_owner.assert_called_once_with("Retro", 3.0)
         assert approved["name"] == "Guest"
         assert rejected["sighting_id"] == 7
+        assert rejected_all["rejected"] == 4
+        assert owner["name"] == "Retro"

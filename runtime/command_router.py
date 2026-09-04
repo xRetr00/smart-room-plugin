@@ -167,6 +167,15 @@ class CommandRouter:
     def _handle_vision_reject(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return self._runtime.vision_reject(int(params.get("sighting_id", 0)))
 
+    def _handle_vision_reject_all(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.vision_reject_all()
+
+    def _handle_vision_set_owner(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(params.get("name") or "").strip()
+        if not name:
+            return {"success": False, "error": "person name is required"}
+        return self._runtime.vision_set_owner(name)
+
     def _handle_phone_location_changed(self, params: Dict[str, Any]) -> Dict[str, Any]:
         required = {"who", "transition", "zone", "at", "delivery_id", "source"}
         missing = sorted(required.difference(params))

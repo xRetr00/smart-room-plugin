@@ -183,12 +183,15 @@ SMART_ROOM_VISION_IDENTITY_SCHEMA: Dict[str, Any] = {
     "name": "smart_room_vision_identity",
     "description": (
         "Change the Smart Room face library. Enroll the visible owner, approve and name "
-        "a visitor sighting, or reject a visitor sighting."
+        "a visitor sighting, choose the owner, or reject one or all visitor sightings."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["enroll_owner", "approve", "reject"]},
+            "action": {
+                "type": "string",
+                "enum": ["enroll_owner", "approve", "reject", "reject_all", "set_owner"],
+            },
             "name": {"type": "string"},
             "sighting_id": {"type": "integer", "minimum": 1},
             "owner": {"type": "boolean"},
@@ -316,11 +319,13 @@ def handle_smart_room_vision_identity(args: Dict[str, Any], **_kw) -> str:
         "enroll_owner": "vision_enroll_owner",
         "approve": "vision_approve",
         "reject": "vision_reject",
+        "reject_all": "vision_reject_all",
+        "set_owner": "vision_set_owner",
     }.get(action)
     if not method:
         return _err("invalid vision identity action")
     params = {key: value for key, value in args.items() if key != "action"}
-    if action in {"enroll_owner", "approve"} and not str(params.get("name") or "").strip():
+    if action in {"enroll_owner", "approve", "set_owner"} and not str(params.get("name") or "").strip():
         return _err("name is required")
     if action in {"approve", "reject"} and int(params.get("sighting_id") or 0) <= 0:
         return _err("sighting_id must be positive")
