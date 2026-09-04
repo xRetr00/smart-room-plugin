@@ -139,6 +139,9 @@ class VisionState:
     sleep_state: str = "unknown"  # unknown | awake | resting
     stale: bool = True
     error: Optional[str] = None
+    face_model: str = "buffalo_l"
+    face_model_loaded: bool = False
+    face_provider: str = "CPUExecutionProvider"
     capabilities: Dict[str, bool] = field(default_factory=lambda: {
         "faces": False,
         "gestures": False,

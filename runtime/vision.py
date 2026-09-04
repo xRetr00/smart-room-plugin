@@ -389,6 +389,8 @@ class LocalVisionAnalyzer:
 
     def __init__(self, *, auto_download: bool = True) -> None:
         self.auto_download = auto_download
+        self.face_model = "buffalo_l"
+        self.face_provider = "CPUExecutionProvider"
         self._face: Any = None
         self._gesture: Any = None
         self._pose: Any = None
@@ -398,9 +400,9 @@ class LocalVisionAnalyzer:
         from insightface.app import FaceAnalysis
 
         face = FaceAnalysis(
-            name="buffalo_l",
+            name=self.face_model,
             root=str(vision_models_home()),
-            providers=["CPUExecutionProvider"],
+            providers=[self.face_provider],
         )
         face.prepare(ctx_id=-1, det_size=DETECT_SIZE)
         self._face = face
@@ -525,6 +527,13 @@ class VisionWorker:
         self.state = VisionState(
             enabled=bool(config.get("enabled", False)),
             camera_index=int(config.get("camera_index", 0)),
+            face_model=str(getattr(self.analyzer, "face_model", "buffalo_l")),
+            face_provider=str(
+                getattr(self.analyzer, "face_provider", "CPUExecutionProvider")
+            ),
+            face_model_loaded=bool(
+                (getattr(self.analyzer, "capabilities", {}) or {}).get("faces", False)
+            ),
         )
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -799,6 +808,7 @@ class VisionWorker:
             self.state.gesture_confidence = round(gesture_confidence, 4)
             self.state.sleep_state = sleep_state
             self.state.capabilities = dict(analysis.get("capabilities") or self.analyzer.capabilities)
+            self.state.face_model_loaded = bool(self.state.capabilities.get("faces", False))
             snapshot = VisionState(**asdict(self.state))
         self.publish_state(snapshot)
         if sleep_state != previous_sleep and sleep_state in {"awake", "resting"}:

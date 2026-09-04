@@ -642,6 +642,16 @@ class Runtime:
         if self._mqtt:
             self._mqtt.publish_state(snapshot)
 
+    def refresh_devices(self) -> Dict[str, Any]:
+        """Force a clean device reconnect and publish a fresh hardware poll."""
+        if not self._tuya:
+            return {"success": False, "error": "Tuya controller is unavailable"}
+        with self._command_lock:
+            self._tuya.refresh()
+            self._poll_devices()
+        with self._state_lock:
+            return {"success": True, "state": self._state.to_dict()}
+
     def _handle_welcome_transition(self, was_occupied: bool, occupied: bool) -> None:
         welcome = self._config.get("welcome") or {}
         if not occupied:

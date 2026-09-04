@@ -8,6 +8,8 @@ from plugins.smart_room.runtime.vision import FaceLibrary, VisionWorker
 
 class FakeAnalyzer:
     capabilities = {"faces": True, "gestures": True, "posture": True}
+    face_model = "test-face-model"
+    face_provider = "TestExecutionProvider"
 
 
 def test_vision_state_round_trips_with_room_state() -> None:
@@ -26,6 +28,8 @@ def test_vision_state_round_trips_with_room_state() -> None:
     assert restored.vision.camera_open is True
     assert restored.vision.owner_visible is True
     assert restored.vision.activity == "moving"
+    assert restored.vision.face_model == "buffalo_l"
+    assert restored.vision.face_model_loaded is False
 
 
 def test_face_library_matches_owner_and_folds_repeated_unknowns(tmp_path) -> None:
@@ -167,6 +171,9 @@ def test_worker_publishes_bounded_facts_and_structured_gesture(tmp_path) -> None
         state = asdict(published[-1])
         assert state["person_count"] == 1
         assert state["activity"] == "moving"
+        assert state["face_model"] == "test-face-model"
+        assert state["face_model_loaded"] is True
+        assert state["face_provider"] == "TestExecutionProvider"
         assert state["gesture"] == "Open_Palm"
         assert "frame" not in state
         assert [kind for kind, _ in events] == ["vision_gesture", "vision_sleep_state"]

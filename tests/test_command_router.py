@@ -38,6 +38,9 @@ class TestCommandRouter:
         self.runtime.vision_reject = MagicMock(return_value={"success": True, "sighting_id": 7})
         self.runtime.vision_reject_all = MagicMock(return_value={"success": True, "rejected": 4})
         self.runtime.vision_set_owner = MagicMock(return_value={"success": True, "name": "Retro"})
+        self.runtime.refresh_devices = MagicMock(
+            return_value={"success": True, "state": self.state.to_dict()}
+        )
         self.runtime.get_status = MagicMock(
             return_value={
                 "running": True,
@@ -84,6 +87,12 @@ class TestCommandRouter:
         assert result["success"] is True
         assert "health" in result
         assert "mqtt" in result["health"]
+
+    def test_refresh_devices_forces_a_live_hardware_poll(self):
+        result = self.router.dispatch("refresh_devices", {})
+
+        assert result["success"] is True
+        self.runtime.refresh_devices.assert_called_once_with()
 
     def test_get_diagnostic_returns_full_dump(self):
         result = self.router.dispatch("get_diagnostic", {})

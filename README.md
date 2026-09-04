@@ -11,6 +11,10 @@
 - **Local vision**: InsightFace identity matching with quality-gated enrollment,
   a bounded visitor-review queue, nearest-known suggestions, and automatic
   thumbnail cleanup; raw camera frames never leave the sidecar
+- **Visible model health**: Vision state names the InsightFace model/provider
+  and reports whether face inference loaded successfully
+- **Device recovery**: Background polling rebuilds stale Tuya connections after
+  circuit-breaker backoff, with an immediate reconnect-and-poll RPC for the UI
 - **World-awareness**: Marvi knows where you are, what mode the room is in, light state — as ambient context, not memory writes
 - **Marvi integration**: Plugin tools (`smart_room_state`, `smart_room_set_mode`, etc.) + session context line + subconscious transitions
 

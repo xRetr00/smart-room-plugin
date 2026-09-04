@@ -136,6 +136,9 @@ class CommandRouter:
         health["vision"] = runtime.get("vision", {})
         return {"success": True, "health": health}
 
+    def _handle_refresh_devices(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._runtime.refresh_devices()
+
     def _handle_vision_observe(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return self._runtime.vision_observe()
 

@@ -519,6 +519,36 @@ def test_tuya_v35_bulb_uses_standard_hsv_dps(monkeypatch):
     assert Device.values == expected
 
 
+def test_tuya_reconnects_after_the_circuit_breaker_backoff(monkeypatch):
+    from plugins.smart_room.runtime.tuya import controller
+
+    room = controller.TuyaController({})
+    reconnect = MagicMock()
+    monkeypatch.setattr(room, "_connect_device", reconnect)
+    room._health["bulb"]["consecutive_failures"] = 3
+    room._health["bulb"]["circuit_open_until"] = time.monotonic() - 1
+    try:
+        result = room._run("bulb", "get_status", lambda: {"success": True})
+
+        assert result["success"] is True
+        reconnect.assert_called_once_with("bulb")
+        assert room._health["bulb"]["consecutive_failures"] == 0
+    finally:
+        room.stop()
+
+
+def test_manual_device_refresh_reconnects_then_polls():
+    runtime = Runtime({})
+    runtime._tuya = MagicMock()
+    runtime._poll_devices = MagicMock()
+
+    result = runtime.refresh_devices()
+
+    assert result["success"] is True
+    runtime._tuya.refresh.assert_called_once_with()
+    runtime._poll_devices.assert_called_once_with()
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Smart Room runtime is Windows-only")
 def test_runtime_crash_is_restarted_and_shutdown_is_clean():
     import yaml

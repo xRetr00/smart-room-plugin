@@ -39,6 +39,7 @@ class TuyaController:
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="smart_room_tuya")
         self._slots = threading.BoundedSemaphore(int((config.get("tuya") or {}).get("queue_size", 16)))
         self._locks = {"bulb": threading.Lock(), "he20": threading.Lock()}
+        self._connect_lock = threading.Lock()
         self._health = {
             name: {"consecutive_failures": 0, "last_success": None, "last_command": None, "queue_depth": 0, "circuit_open_until": 0.0}
             for name in ("bulb", "he20")
@@ -54,36 +55,48 @@ class TuyaController:
             logger.warning("tinytuya not installed — Tuya control disabled")
             return
 
-        tuya_cfg = self._config.get("tuya", {})
-        for name in ("bulb", "he20"):
-            dev_cfg = tuya_cfg.get(name, {})
-            ip = dev_cfg.get("ip")
-            key = os.getenv(
-                "SMART_ROOM_TUYA_BULB_KEY" if name == "bulb" else "SMART_ROOM_TUYA_HE20_KEY",
-                "",
-            )
-            dev_id = dev_cfg.get("device_id", "")
-            protocol = dev_cfg.get("protocol", "3.3")
+        with self._connect_lock:
+            for name in ("bulb", "he20"):
+                self._connect_device(name)
 
-            if ip and key and dev_id:
-                try:
-                    dev = tinytuya.Device(
-                        dev_id=dev_id,
-                        address=ip,
-                        local_key=key,
-                    )
-                    dev.set_version(float(protocol))
-                    if hasattr(dev, "set_socketTimeout"):
-                        dev.set_socketTimeout(float((tuya_cfg.get("worker") or {}).get("timeout_seconds", 4)))
-                    self._devices[name] = dev
-                    logger.info("Tuya device '%s' connected at %s", name, ip)
-                except Exception as e:
-                    logger.error("Failed to connect Tuya device '%s': %s", name, e)
+    def _connect_device(self, name: str) -> None:
+        """Replace one device object so a power-cycled device gets a clean socket."""
+        tuya_cfg = self._config.get("tuya", {})
+        dev_cfg = tuya_cfg.get(name, {})
+        ip = dev_cfg.get("ip")
+        key = os.getenv(
+            "SMART_ROOM_TUYA_BULB_KEY" if name == "bulb" else "SMART_ROOM_TUYA_HE20_KEY",
+            "",
+        )
+        dev_id = dev_cfg.get("device_id", "")
+        protocol = dev_cfg.get("protocol", "3.3")
+        self._devices.pop(name, None)
+        if not (ip and key and dev_id):
+            return
+        try:
+            dev = tinytuya.Device(dev_id=dev_id, address=ip, local_key=key)
+            dev.set_version(float(protocol))
+            if hasattr(dev, "set_socketTimeout"):
+                dev.set_socketTimeout(
+                    float((tuya_cfg.get("worker") or {}).get("timeout_seconds", 4))
+                )
+            self._devices[name] = dev
+            logger.info("Tuya device '%s' connected at %s", name, ip)
+        except Exception as e:
+            logger.error("Failed to connect Tuya device '%s': %s", name, e)
 
     def _run(self, device: str, command: str, operation, *, timeout: float = 5.0) -> Dict[str, Any]:
         health = self._health[device]
-        if time.monotonic() < health["circuit_open_until"]:
+        now = time.monotonic()
+        if now < health["circuit_open_until"]:
             return {"success": False, "error": f"{device} circuit breaker is open", "code": "CIRCUIT_OPEN"}
+        if health["circuit_open_until"] and health["consecutive_failures"] >= 3:
+            # The device may have been physically powered off. Once the
+            # backoff expires, discard tinytuya's old connection object before
+            # probing again so the automatic poll can restore online state.
+            with self._connect_lock:
+                self._connect_device(device)
+            health["circuit_open_until"] = 0.0
         if not self._slots.acquire(blocking=False):
             return {"success": False, "error": "Tuya command queue is full", "code": "QUEUE_FULL"}
         health["queue_depth"] += 1
@@ -279,9 +292,17 @@ class TuyaController:
             return {"success": False, "error": str(e), "online": False}
 
     def refresh(self) -> None:
-        """Reconnect all devices (call on config change)."""
-        self._devices.clear()
-        self._connect_devices()
+        """Reconnect all devices immediately and reset transient backoff."""
+        with self._connect_lock:
+            self._devices.clear()
+            if HAS_TINYTUYA:
+                for name in ("bulb", "he20"):
+                    self._connect_device(name)
+        for health in self._health.values():
+            health["consecutive_failures"] = 0
+            health["circuit_open_until"] = 0.0
+        self._last_light_signature = None
+        self._last_light_result = None
 
     def stop(self) -> None:
         """Stop any active alarm flash loop."""
