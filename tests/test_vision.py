@@ -144,6 +144,28 @@ def test_low_quality_faces_are_not_added_to_the_review_queue(tmp_path) -> None:
         worker.stop()
 
 
+def test_review_crop_preserves_context_and_stays_inside_the_frame() -> None:
+    left, top, right, bottom = VisionWorker._review_crop_bounds(
+        1280, 720, [500.0, 200.0, 605.0, 383.0]
+    )
+
+    assert 0 <= left < 500 < 605 < right <= 1280
+    assert 0 <= top < 200 < 383 < bottom <= 720
+    assert right - left > 105 * 3
+    assert bottom - top > 183 * 2
+    assert abs(((right - left) / (bottom - top)) - (4 / 3)) < 0.01
+
+
+def test_review_crop_clamps_at_camera_edges() -> None:
+    left, top, right, bottom = VisionWorker._review_crop_bounds(
+        640, 480, [510.0, 330.0, 630.0, 470.0]
+    )
+
+    assert (right, bottom) == (640, 480)
+    assert left >= 0
+    assert top >= 0
+
+
 def test_worker_publishes_bounded_facts_and_structured_gesture(tmp_path) -> None:
     published = []
     events = []

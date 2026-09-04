@@ -679,17 +679,39 @@ class VisionWorker:
             analysis = self.analyzer.analyze(frame)
             self._apply_analysis(frame, analysis, moving=motion >= motion_threshold)
 
+    @staticmethod
+    def _review_crop_bounds(
+        frame_width: int, frame_height: int, box: list[float]
+    ) -> tuple[int, int, int, int]:
+        """Return a bounded 4:3 context crop around a detected face."""
+        x1, y1, x2, y2 = (max(0, int(value)) for value in box[:4])
+        face_width = max(1, min(frame_width, x2) - min(frame_width, x1))
+        face_height = max(1, min(frame_height, y2) - min(frame_height, y1))
+        max_width = max(1, min(frame_width, 960))
+        max_height = max(1, min(frame_height, 720))
+        target_height = max(face_height * 2.5, face_width * 2.25, 240.0)
+        scale = min(1.0, max_width / (target_height * 4.0 / 3.0), max_height / target_height)
+        crop_height = max(face_height, min(max_height, int(round(target_height * scale))))
+        crop_width = max(face_width, min(max_width, int(round(crop_height * 4.0 / 3.0))))
+
+        center_x = (x1 + x2) / 2.0
+        # Bias down slightly so the review image includes shoulders and useful context.
+        center_y = (y1 + y2) / 2.0 + face_height * 0.2
+        left = max(0, min(frame_width - crop_width, int(round(center_x - crop_width / 2.0))))
+        top = max(0, min(frame_height - crop_height, int(round(center_y - crop_height / 2.0))))
+        return left, top, left + crop_width, top + crop_height
+
     def _thumbnail(self, frame: Any, box: list[float]) -> Optional[str]:
         try:
             import cv2
 
-            x1, y1, x2, y2 = (max(0, int(value)) for value in box[:4])
-            pad = int(0.25 * max(1, x2 - x1))
-            crop = frame[max(0, y1 - pad):y2 + pad, max(0, x1 - pad):x2 + pad]
+            frame_height, frame_width = frame.shape[:2]
+            x1, y1, x2, y2 = self._review_crop_bounds(frame_width, frame_height, box)
+            crop = frame[y1:y2, x1:x2]
             if crop.size == 0:
                 return None
             path = self.library.dir / "faces" / f"{time.time_ns()}.jpg"
-            return str(path) if cv2.imwrite(str(path), crop) else None
+            return str(path) if cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 90]) else None
         except Exception:
             return None
 

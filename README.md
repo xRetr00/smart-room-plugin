@@ -10,7 +10,8 @@
 - **Sound controls**: Plugin-local quantized YAMNet detection — double clap toggles the light; triple clap enters Sleep; a lone clap is ignored
 - **Local vision**: InsightFace identity matching with quality-gated enrollment,
   a bounded visitor-review queue, nearest-known suggestions, and automatic
-  thumbnail cleanup; raw camera frames never leave the sidecar
+  native-aspect 4:3 context crops for identity review and automatic crop cleanup;
+  raw camera frames never leave the sidecar
 - **Visible model health**: Vision state names the InsightFace model/provider
   and reports whether face inference loaded successfully
 - **Device recovery**: Background polling rebuilds stale Tuya connections after
