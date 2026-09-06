@@ -27,6 +27,7 @@ import signal
 import socket
 import subprocess
 import sys
+import contextlib
 import threading
 import time
 import uuid
@@ -745,6 +746,20 @@ class Runtime:
             ]
             pending_entries.extend(face_visitors)
 
+        # Somebody who is not the owner. Photograph them, on a thread, because
+        # the burst takes half a minute and the welcome must not wait for it.
+        #
+        # Three frames rather than one: the single frame taken at the moment
+        # somebody walks in is very often the back of their head, and ten
+        # seconds apart covers turning round, sitting down and looking up.
+        if not owner_detected and self._vision:
+            threading.Thread(
+                target=self._photograph_visitor,
+                args=(entry_at, classification),
+                daemon=True,
+                name="smart_room_visitor_photos",
+            ).start()
+
         self._emit_event("room_entry", {
             "entry_at": entry_at,
             "classification": classification,
@@ -791,15 +806,122 @@ class Runtime:
         except (TypeError, ValueError):
             return False
 
+    #: Below this, a phone that has gone quiet is more likely flat than gone.
+    #: Taken from the owner's real OwnTracks log, which has reports at 10% and
+    #: 20% with `bs=1` (unplugged) on both.
+    BATTERY_LOW = 25
+
+    def _photograph_visitor(self, entry_at: str, classification: str) -> None:
+        """A burst of photographs of whoever is in the room, with the light on.
+
+        The light matters as much as the shutter: an unrecognised person at
+        night photographs as a dark shape, and the whole purpose of this is
+        that the owner can look at the pictures afterwards and say who it was.
+        """
+        # Sleep mode changes what this is allowed to do, and getting it wrong
+        # is the worst outcome here rather than a detail.
+        #
+        # Somebody asleep in a dark room is a person the camera cannot see and
+        # a phone that has stopped advertising -- which classifies as
+        # "unidentified", which lands exactly here. Turning the light on at
+        # 80% to photograph the owner in his own bed is not a security feature,
+        # it is an alarm clock. So in sleep mode the burst happens in whatever
+        # light there is: a dark frame is worth having, and waking him to get
+        # a bright one is not.
+        asleep = self._state.modes.active_mode == "sleep"
+        restored = None
+        try:
+            if not self._state.light.on and not asleep:
+                restored = False
+                with contextlib.suppress(Exception):
+                    self.set_light(True, brightness=80)
+            result = self._vision.photograph()
+            photos = result.get("photos") or []
+            if not photos:
+                return
+            with self._state_lock:
+                for entry in reversed(self._state.unreported_visitor_entries):
+                    if entry.get("at") == entry_at:
+                        entry["photos"] = photos
+                        break
+                save_state(self._state)
+            self._emit_event("visitor_photos", {
+                "entry_at": entry_at,
+                "classification": classification,
+                "photos": photos,
+                # Said on the record, because a set of dark frames with no
+                # explanation reads as a broken camera.
+                "lit": not asleep,
+                "summary": (
+                    f"{len(photos)} photographs of an unrecognised visitor"
+                    + ("" if not asleep else ", taken without the light while sleep mode was on")
+                ),
+            })
+            logger.info("Photographed a visitor: %d frames from %s", len(photos), entry_at)
+        except Exception:
+            logger.exception("Could not photograph a visitor")
+        finally:
+            if restored is False:
+                with contextlib.suppress(Exception):
+                    self.set_light(False)
+
     def _classify_entry(self, entry_at: str) -> tuple[str, str]:
+        """Who just came in, from the sensors *and* the situation.
+
+        The rules this grew from were sound and are kept in the same order:
+        BLE means the owner, a recent "home" from OwnTracks means the owner
+        even when BLE is asleep, and a phone that is somewhere else means
+        somebody who is not him. What they could not do is notice when a
+        reading had stopped meaning anything.
+
+        Two additions, both of them about *why* a signal is silent:
+
+        A face outranks everything. It does not need the mmWave or the phone
+        to agree, and it used not to be consulted here at all.
+
+        A phone can go quiet for a reason. An iPhone in deep sleep stops
+        advertising and one at 8% stops because it is dead, so before calling
+        somebody a stranger on the strength of an absent phone, this asks
+        whether the phone had the power to be present -- and whether its last
+        word is recent enough to mean anything. The owner's real state had
+        `home: true` from a geofence event thirteen days old.
+        """
+        window = max(60, int((self._config.get("welcome") or {}).get("owner_evidence_window_seconds", 3600)))
+
+        # A face settles it, and needs nothing else to agree.
+        if getattr(self._state.vision, "owner_visible", False) and not getattr(
+            self._state.vision, "stale", False
+        ):
+            self._state.last_owner_seen_at = entry_at
+            return "owner", "camera_recognised_owner"
+
         if self._ble_detected:
             self._state.last_owner_seen_at = entry_at
             return "owner", "ble"
+
+        geofence_fresh = self._within_seconds(
+            self._state.location.last_geofence_at, entry_at, window
+        )
+
         if not self._state.location.home:
+            if not geofence_fresh:
+                # "Away", from a reading old enough to mean nothing. Somebody
+                # is in the room and this cannot say who -- which is not the
+                # same claim as "a stranger is here", and is the one the
+                # thirteen-day-old geofence would have made.
+                return "unidentified", "phone_away_but_reading_is_stale"
+            battery = self._state.location.battery_percent
+            unplugged = self._state.location.battery_state in (None, 1)
+            if isinstance(battery, int) and battery <= self.BATTERY_LOW and unplugged:
+                # The phone stopped talking because it was dying, not because
+                # its owner left. Do not accuse him over a flat battery.
+                return "unidentified", f"phone_battery_{battery}_percent"
             return "unknown_visitor", "owner_phone_away"
 
-        window = max(60, int((self._config.get("welcome") or {}).get("owner_evidence_window_seconds", 3600)))
-        if self._within_seconds(self._state.location.last_geofence_at, entry_at, window):
+        if geofence_fresh:
+            # The deep-sleep case: the phone said "home" recently and BLE has
+            # gone quiet, which is what an iPhone does rather than evidence of
+            # anything.
             self._state.last_owner_seen_at = entry_at
             return "owner", "owntracks_recent"
         if self._within_seconds(self._state.last_owner_seen_at, entry_at, window):

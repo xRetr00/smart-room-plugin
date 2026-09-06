@@ -590,6 +590,56 @@ class VisionWorker:
     def people(self) -> Dict[str, Any]:
         return {"success": True, "people": self.library.people(), "owner": self.library.owner_name()}
 
+    #: How many photographs a visitor burst takes, and how far apart.
+    #:
+    #: One is not enough and the reason is mundane: a single frame at the
+    #: moment somebody walks in is very often the back of their head. Three,
+    #: ten seconds apart, covers turning round, sitting down, and looking up --
+    #: and thirty seconds is short enough that they are still in the room.
+    BURST_PHOTOS = 3
+    BURST_GAP_SECONDS = 10.0
+
+    def photograph(self, count: int = 0, gap: float = 0.0) -> Dict[str, Any]:
+        """Take a burst of whole-frame photographs, for a visitor report.
+
+        Whole frames rather than face crops: a crop answers "who" and this has
+        to answer "what happened", which needs the room in it. Each is stamped
+        with the wall-clock time it was taken, because the answer to "when was
+        somebody in my room" is the entire point of the report and a file
+        modification time is not an answer -- it changes when the file is
+        copied.
+        """
+        import cv2
+
+        count = int(count or self.BURST_PHOTOS)
+        gap = float(gap or self.BURST_GAP_SECONDS)
+        folder = self.library.dir / "visits"
+        folder.mkdir(parents=True, exist_ok=True)
+        taken: list[Dict[str, Any]] = []
+        for index in range(max(1, count)):
+            if index:
+                self._stop.wait(gap)
+                if self._stop.is_set():
+                    break
+            with self._lock:
+                frame = None if self._latest_frame is None else self._latest_frame.copy()
+            if frame is None:
+                continue
+            at = datetime.now(timezone.utc)
+            path = folder / f"{at.strftime('%Y%m%dT%H%M%SZ')}-{index + 1}.jpg"
+            try:
+                written = cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            except Exception:
+                written = False
+            if written:
+                taken.append({
+                    # ISO, from the clock, at the moment the frame was copied.
+                    "at": at.isoformat(),
+                    "path": str(path),
+                    "index": index + 1,
+                })
+        return {"success": bool(taken), "photos": taken, "count": len(taken)}
+
     def visitors(self) -> Dict[str, Any]:
         return {"success": True, "visitors": self.library.unreported_visitors()}
 
