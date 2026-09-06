@@ -80,6 +80,27 @@ def test_owntracks_location_initializes_current_region():
     geofence.assert_called_once_with("sync", "home")
 
 
+def test_owntracks_location_outside_every_region_clears_the_zone():
+    """An empty `inregions` is a statement, not a silence.
+
+    It says "in no region at all", and discarding it meant leaving home
+    without a `transition` left the state reading `home` until something else
+    corrected it -- and nothing else does. The owner's own report log has this
+    exact payload in it, with the battery at 10%.
+    """
+    client, _, geofence, _ = _client()
+    client._handle_owntracks({"_type": "location", "inregions": [], "batt": 10, "bs": 1})
+    geofence.assert_called_once_with("sync", "")
+
+
+def test_owntracks_location_without_regions_says_nothing():
+    # No `inregions` key at all is genuinely no news -- an older client, or a
+    # payload that carries something else -- and must not clear the zone.
+    client, _, geofence, _ = _client()
+    client._handle_owntracks({"_type": "location", "lat": 41.1, "lon": 29.2})
+    geofence.assert_not_called()
+
+
 def test_every_owntracks_message_is_forwarded_for_history():
     report = MagicMock()
     client, _, _, _ = _client()

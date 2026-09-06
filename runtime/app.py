@@ -381,7 +381,16 @@ class Runtime:
         """Handle optional OwnTracks events through the same location path."""
         if action == "sync":
             with self._state_lock:
+                # An empty zone means "in no region", which is a different
+                # thing from "no news" and has to be able to clear `home`.
                 if self._state.location.zone == zone and self._state.location.source == "owntracks":
+                    # Nothing changed, and nothing to stamp here.
+                    #
+                    # `_on_owntracks` already advances `last_geofence_at` for
+                    # every location report, using the *phone's* `tst` rather
+                    # than the moment MQTT delivered it -- which is the point:
+                    # a report that sat in a queue for ten minutes is ten
+                    # minutes old, and stamping it `now` here would hide that.
                     return
                 stamp = now_iso()
                 self._state.location.zone = zone
@@ -406,9 +415,23 @@ class Runtime:
         if record.get("duplicate"):
             logger.debug("Ignored duplicate retained OwnTracks report at=%s", record["reported_at"])
             return
-        if record["type"] == "location" and record["zone"]:
+        if record["type"] == "location":
+            # Every location report, not only the ones inside a region.
+            #
+            # Gating this on `record["zone"]` meant the freshness stamp only
+            # advanced while the phone was somewhere named -- so a phone
+            # reporting from outside every region looked exactly like a phone
+            # that had stopped reporting, and the owner's real log has both.
             with self._state_lock:
                 self._state.location.last_geofence_at = record["reported_at"]
+                if record.get("battery_percent") is not None:
+                    self._state.location.battery_percent = record["battery_percent"]
+                battery_state = (record.get("data") or {}).get("bs")
+                if battery_state is not None:
+                    self._state.location.battery_state = int(battery_state)
+                regions = (record.get("data") or {}).get("inregions")
+                if isinstance(regions, list):
+                    self._state.location.regions = [str(one).strip().lower() for one in regions]
                 save_state(self._state)
         logger.info(
             "OwnTracks report recorded type=%s event=%s zone=%s at=%s lat=%s lon=%s accuracy_m=%s",

@@ -76,6 +76,18 @@ class PhoneLocation:
     source: str = "unknown"  # "owntracks", "ble", "unknown"
     last_geofence_at: Optional[str] = None
     last_event_key: Optional[str] = None
+    #: Every region the phone is currently inside, from `inregions`.
+    #:
+    #: The full list rather than the first one, because "which region" is a
+    #: question worth answering when the answer is not home -- the owner's own
+    #: log has `bakery` in it -- and regions can nest.
+    regions: List[str] = field(default_factory=list)
+    #: Battery percentage, and status: 0 unknown, 1 unplugged, 2 charging,
+    #: 3 full. Carried because it explains a *silence*: a phone that has gone
+    #: quiet with 4% left is a flat battery, and a phone that has gone quiet at
+    #: 80% is somebody who left the house.
+    battery_percent: Optional[int] = None
+    battery_state: Optional[int] = None
 
 
 @dataclass

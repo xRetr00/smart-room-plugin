@@ -177,9 +177,19 @@ class MQTTClient:
             elif event == "leave":
                 self._on_geofence("leave", zone)
         elif event_type == "location":
+            # `inregions` is level-triggered and self-healing, which is the
+            # whole reason to read it: a `transition` fires once when you cross
+            # a boundary, so a single missed one leaves the last edge standing
+            # forever. A location report says where you are *now*.
+            #
+            # An empty list is the case that was being thrown away, and it is
+            # not an absence of information -- it is the statement "in no
+            # region at all". Discarding it meant leaving home without a
+            # transition left the state reading `home` until something else
+            # corrected it, and nothing else does.
             regions = payload.get("inregions")
-            if isinstance(regions, list) and regions:
-                self._on_geofence("sync", str(regions[0]).strip().lower())
+            if isinstance(regions, list):
+                self._on_geofence("sync", str(regions[0]).strip().lower() if regions else "")
 
     def _handle_espresense(self, topic: str, payload: Dict[str, Any]) -> None:
         """Process ESPresense BLE presence data."""
