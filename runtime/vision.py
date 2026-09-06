@@ -15,6 +15,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import contextlib
 import time
 from typing import Any, Callable, Dict, Optional
 from urllib.request import urlopen
@@ -539,6 +540,8 @@ class VisionWorker:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._latest_frame: Any = None
+        #: The open camera, so a photograph can ask it for a bigger frame.
+        self._capture: Any = None
         self._latest_embeddings: list[list[float]] = []
         self._last_gesture: Optional[str] = None
         self._last_gesture_at = 0.0
@@ -616,13 +619,36 @@ class VisionWorker:
         folder = self.library.dir / "visits"
         folder.mkdir(parents=True, exist_ok=True)
         taken: list[Dict[str, Any]] = []
+
+        # Turned up for the burst, and put back after.
+        #
+        # The stream is small on purpose -- face recognition has to keep up
+        # with it -- and a photograph has the opposite requirement: it is
+        # looked at once, by a person, who needs to be able to say who that
+        # was. Reading `_latest_frame` gave the recognition-sized frame, which
+        # is exactly the wrong one.
+        capture = self._capture
+        restore: tuple[int, int] | None = None
+        if capture is not None:
+            got = self._resize_capture(capture, self._photo_size())
+            restore = self._stream_size()
+            logger.info("Photographing at %dx%d", got[0], got[1])
+
         for index in range(max(1, count)):
             if index:
                 self._stop.wait(gap)
                 if self._stop.is_set():
                     break
-            with self._lock:
-                frame = None if self._latest_frame is None else self._latest_frame.copy()
+            frame = None
+            if capture is not None:
+                with contextlib.suppress(Exception):
+                    ok, grabbed = capture.read()
+                    frame = grabbed if ok else None
+            if frame is None:
+                # No camera handle, or the read failed. The recognition frame
+                # is worse than a full one and much better than nothing.
+                with self._lock:
+                    frame = None if self._latest_frame is None else self._latest_frame.copy()
             if frame is None:
                 continue
             at = datetime.now(timezone.utc)
@@ -632,12 +658,18 @@ class VisionWorker:
             except Exception:
                 written = False
             if written:
+                height, width = frame.shape[:2]
                 taken.append({
-                    # ISO, from the clock, at the moment the frame was copied.
+                    # ISO, from the clock, at the moment the frame was taken.
                     "at": at.isoformat(),
                     "path": str(path),
                     "index": index + 1,
+                    "width": int(width),
+                    "height": int(height),
                 })
+        if capture is not None and restore is not None:
+            # Back to the size recognition expects, whatever happened above.
+            self._resize_capture(capture, restore)
         return {"success": bool(taken), "photos": taken, "count": len(taken)}
 
     def visitors(self) -> Dict[str, Any]:
@@ -677,7 +709,51 @@ class VisionWorker:
             return self.capture_factory(self.state.camera_index)
         import cv2
 
-        return cv2.VideoCapture(self.state.camera_index, cv2.CAP_DSHOW)
+        capture = cv2.VideoCapture(self.state.camera_index, cv2.CAP_DSHOW)
+        # The configured size, actually applied.
+        #
+        # `width` and `height` have been in the config since it was written and
+        # nothing ever set them, so the stream ran at whatever the driver
+        # defaulted to -- usually 640x480 on DSHOW. Everything downstream was
+        # tuned against that resolution without anybody choosing it.
+        self._resize_capture(capture, self._stream_size())
+        return capture
+
+    def _stream_size(self) -> tuple[int, int]:
+        """What the running stream should be: small enough to stay fast."""
+        return (
+            max(160, int(self.config.get("width", 1280) or 1280)),
+            max(120, int(self.config.get("height", 720) or 720)),
+        )
+
+    def _photo_size(self) -> tuple[int, int]:
+        """And what a photograph should be: as much as the camera will give.
+
+        Face recognition runs on a deliberately small frame because it has to
+        keep up. A photograph is looked at by a person afterwards, once, and
+        the whole point of it is being able to say who that was -- so it gets
+        the sensor's full resolution even though the stream does not.
+        """
+        return (
+            max(640, int(self.config.get("photo_width", 1920) or 1920)),
+            max(480, int(self.config.get("photo_height", 1080) or 1080)),
+        )
+
+    @staticmethod
+    def _resize_capture(capture: Any, size: tuple[int, int]) -> tuple[int, int]:
+        """Ask the camera for a size. Returns what it actually gave."""
+        import cv2
+
+        with contextlib.suppress(Exception):
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, size[0])
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, size[1])
+        try:
+            return (
+                int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+            )
+        except Exception:
+            return size
 
     def _run(self) -> None:
         retry_seconds = max(1.0, float(self.config.get("reconnect_seconds", 3)))
@@ -687,6 +763,10 @@ class VisionWorker:
                 capture = self._open_capture()
                 if not capture.isOpened():
                     raise RuntimeError(f"camera {self.state.camera_index} unavailable")
+                # Held so a photograph can ask the same camera for a bigger
+                # frame; there is only one device and DSHOW will not open it
+                # twice.
+                self._capture = capture
                 self._set_state(running=True, camera_open=True, stale=False, error=None)
                 self._capture_loop(capture)
             except Exception as exc:

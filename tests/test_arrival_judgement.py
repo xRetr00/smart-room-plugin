@@ -134,3 +134,119 @@ def test_the_visitor_burst_lights_the_room_when_nobody_is_asleep(monkeypatch) ->
     assert lights.call_count == 2, "did not light the room and put it back"
     assert lights.call_args_list[0].args[0] is True
     assert lights.call_args_list[-1].args[0] is False
+
+
+def _worker(frames):
+    """A VisionWorker with a fake camera, for the burst."""
+    from plugins.smart_room.runtime.vision import VisionWorker
+
+    class _Capture:
+        def __init__(self):
+            self.size = (640, 480)
+            self.reads = 0
+
+        def set(self, prop, value):
+            # 3 is CAP_PROP_FRAME_WIDTH, 4 is CAP_PROP_FRAME_HEIGHT.
+            self.size = (value, self.size[1]) if prop == 3 else (self.size[0], value)
+
+        def get(self, prop):
+            return self.size[0] if prop == 3 else self.size[1]
+
+        def read(self):
+            self.reads += 1
+            return (True, frames.pop(0)) if frames else (False, None)
+
+        def isOpened(self):
+            return True
+
+    worker = VisionWorker.__new__(VisionWorker)
+    return worker, _Capture()
+
+
+def test_photographs_are_taken_at_full_resolution_not_the_recognition_size(tmp_path) -> None:
+    """Face recognition runs small on purpose; a photograph must not.
+
+    Reading `_latest_frame` handed back the recognition-sized frame, which is
+    exactly the wrong one -- it is looked at once, by a person, who needs to be
+    able to say who that was.
+    """
+    import numpy as np
+
+    from plugins.smart_room.runtime.vision import VisionWorker
+
+    frames = [np.zeros((1080, 1920, 3), dtype="uint8") for _ in range(3)]
+    worker, capture = _worker(frames)
+    worker.config = {"width": 1280, "height": 720, "photo_width": 1920, "photo_height": 1080}
+    worker._capture = capture
+    worker._lock = __import__("threading").Lock()
+    worker._latest_frame = np.zeros((480, 640, 3), dtype="uint8")
+    worker._stop = __import__("threading").Event()
+
+    class _Library:
+        dir = tmp_path
+
+    worker.library = _Library()
+
+    result = worker.photograph(count=3, gap=0.0)
+
+    assert result["count"] == 3
+    assert all(p["width"] == 1920 and p["height"] == 1080 for p in result["photos"]), (
+        "photographed at the recognition size"
+    )
+    # And the stream is handed back at the size recognition expects.
+    assert capture.size == (1280, 720), f"left the camera at {capture.size}"
+
+
+def test_a_photograph_falls_back_rather_than_failing(tmp_path) -> None:
+    # No camera handle: the recognition frame is worse than a full one and
+    # much better than nothing.
+    import numpy as np
+
+    from plugins.smart_room.runtime.vision import VisionWorker
+
+    worker = VisionWorker.__new__(VisionWorker)
+    worker.config = {}
+    worker._capture = None
+    worker._lock = __import__("threading").Lock()
+    worker._latest_frame = np.zeros((480, 640, 3), dtype="uint8")
+    worker._stop = __import__("threading").Event()
+
+    class _Library:
+        dir = tmp_path
+
+    worker.library = _Library()
+
+    result = worker.photograph(count=2, gap=0.0)
+    assert result["count"] == 2
+    assert result["photos"][0]["width"] == 640
+
+
+def test_asking_the_phone_is_reachable_over_rpc() -> None:
+    """The other direction: the whole picture is built on the phone
+    volunteering, so there was no way to tell a phone that is somewhere quiet
+    from one that has stopped talking altogether."""
+    from plugins.smart_room.runtime.command_router import CommandRouter
+
+    runtime = _runtime(home=True)
+    runtime._mqtt = MagicMock()
+    runtime._mqtt.ask_phone_to_report.return_value = True
+    router = CommandRouter(runtime._state, {}, runtime)
+
+    answer = router.dispatch("ask_phone", {})
+
+    assert answer["status"] == "success"
+    assert answer["asked"] is True
+    runtime._mqtt.ask_phone_to_report.assert_called_once()
+
+
+def test_asking_says_so_when_mqtt_is_down() -> None:
+    from plugins.smart_room.runtime.command_router import CommandRouter
+
+    runtime = _runtime(home=True)
+    runtime._mqtt = MagicMock()
+    runtime._mqtt.ask_phone_to_report.return_value = False
+    router = CommandRouter(runtime._state, {}, runtime)
+
+    answer = router.dispatch("ask_phone", {})
+    assert answer["status"] == "failed"
+    assert "not connected" in answer["error"]

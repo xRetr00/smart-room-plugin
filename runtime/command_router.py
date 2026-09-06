@@ -59,6 +59,29 @@ class CommandRouter:
             **result,
         }
 
+    def _handle_ask_phone(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Ask OwnTracks where the phone is, now.
+
+        The whole location picture is built on the phone volunteering -- on a
+        boundary crossing, on a timer, when the OS wakes it -- so "when did we
+        last hear" and "where is he" were the same question and the answer to
+        both was whatever arrived last, however old. This is the other
+        direction, and it is the only way to tell a phone that is somewhere
+        quiet from one that has stopped talking altogether.
+        """
+        client = getattr(self._runtime, "_mqtt", None)
+        if client is None:
+            return {"success": False, "error": "no MQTT client"}
+        asked = client.ask_phone_to_report()
+        return {
+            "success": bool(asked),
+            "asked": bool(asked),
+            "error": "" if asked else "MQTT is not connected",
+            # So a caller can see whether the answer arrived, by watching this
+            # move rather than by guessing how long to wait.
+            "last_report_at": self._state.location.last_geofence_at,
+        }
+
     def _handle_get_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
             limit = max(1, min(int(params.get("location_limit", 20)), 500))
