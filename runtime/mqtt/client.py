@@ -64,6 +64,9 @@ class MQTTClient:
         # Topics
         ot_cfg = config.get("owntracks", {})
         self._owntracks_topic = ot_cfg.get("topic", "owntracks/shereef/#")
+        #: The device half of the OwnTracks topic, for the `cmd` topic -- which
+        #: is per device where the subscription is per user.
+        self._owntracks_device = str(ot_cfg.get("device", "iphone")).strip() or "iphone"
         esp_cfg = config.get("esp32", {})
         self._room = str(esp_cfg.get("room_id", "smart_room")).strip().lower()
         self._owner_device_id = str(esp_cfg.get("owner_device_id", "")).strip().lower()
@@ -155,15 +158,27 @@ class MQTTClient:
         except (json.JSONDecodeError, UnicodeDecodeError):
             payload = {"value": raw}
 
-        # OwnTracks geofence events
-        if "owntracks" in topic:
-            self._handle_owntracks(payload, topic)
-        # ESPresense BLE presence
-        elif "espresense" in topic:
-            self._handle_espresense(topic, payload)
-        # Commands from Marvi
-        elif self._commands_enabled and topic == self._command_topic:
-            self._on_command(payload)
+        # One bad message must not take the client down with it.
+        #
+        # paho runs these callbacks on its own network thread, and an exception
+        # that escapes here kills that thread -- which unsubscribes everything
+        # at once. That is not hypothetical: a `PermissionError` from an
+        # ordinary Windows file lock, raised inside the ESPresense handler,
+        # stopped OwnTracks reports arriving for a fortnight. Nothing in the
+        # room reported a fault, because from the room's point of view nothing
+        # had failed; the socket was simply gone.
+        try:
+            # OwnTracks geofence events
+            if "owntracks" in topic:
+                self._handle_owntracks(payload, topic)
+            # ESPresense BLE presence
+            elif "espresense" in topic:
+                self._handle_espresense(topic, payload)
+            # Commands from Marvi
+            elif self._commands_enabled and topic == self._command_topic:
+                self._on_command(payload)
+        except Exception:
+            logger.exception("Dropped an MQTT message on %s; the client stays up", topic)
 
     def _handle_owntracks(self, payload: Dict[str, Any], topic: str = "") -> None:
         """Process OwnTracks geofence enter/leave events."""
@@ -240,6 +255,33 @@ class MQTTClient:
             self._entry_seen_at.pop(identity, None)
             self._active_identities.discard(identity)
             self._on_presence(False, rssi, identity)
+
+    def ask_phone_to_report(self) -> bool:
+        """Ask OwnTracks where the phone is, now. True when the ask went out.
+
+        The one thing missing from a system built entirely on the phone
+        volunteering: OwnTracks publishes when it feels like it -- on a
+        boundary crossing, on a timer, when the OS wakes it -- so "when did we
+        last hear" and "where is he" were the same question, and the answer to
+        both was whatever arrived last, however old.
+
+        `reportLocation` is a documented command on the device's own `cmd`
+        topic. The phone answers with a normal `location` payload, which comes
+        back through the usual path with `inregions` and the battery on it, so
+        nothing downstream needs to know this was asked for rather than
+        offered.
+        """
+        if not (self._client and self._connected):
+            logger.info("Cannot ask the phone to report: MQTT is not connected")
+            return False
+        # `owntracks/smart_room/#` -> `owntracks/smart_room/iphone/cmd`. The
+        # wildcard is stripped and the device appended, because the command
+        # topic is per device and the subscription is per user.
+        base = self._owntracks_topic.rstrip("/#").rstrip("/")
+        topic = f"{base}/{self._owntracks_device}/cmd"
+        self._client.publish(topic, json.dumps({"_type": "cmd", "action": "reportLocation"}))
+        logger.info("Asked the phone to report its location on %s", topic)
+        return True
 
     def publish_state(self, state_dict: Dict[str, Any]) -> None:
         """Publish state snapshot to MQTT (retained)."""

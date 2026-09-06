@@ -10,10 +10,11 @@ import json
 import logging
 import shutil
 import threading
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Optional, Any, Dict
 
 from .models import RoomState
 from .paths import config_path, smart_room_home
@@ -50,6 +51,12 @@ def load_state() -> RoomState:
     return RoomState()
 
 
+#: How hard to try before giving up on one state write. Short: the caller is
+#: usually an MQTT callback, and the next tick writes the same state anyway.
+SAVE_ATTEMPTS = 5
+SAVE_RETRY_SECONDS = 0.05
+
+
 def save_state(state: RoomState) -> None:
     """Atomically write state to disk."""
     p = state_path()
@@ -60,8 +67,27 @@ def save_state(state: RoomState) -> None:
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     if p.is_file():
         shutil.copy2(p, backup)
-    tmp.replace(p)
-    logger.debug("State saved (event_id=%d)", state.event_id)
+
+    # Retried, because on Windows `os.replace` fails outright when anything
+    # else holds the target open -- a reader, an indexer, antivirus -- and the
+    # lock is gone milliseconds later.
+    #
+    # It is not a theoretical race. The unhandled PermissionError came back up
+    # through the ESPresense handler and killed the paho client thread, which
+    # takes *every* subscription down with it: OwnTracks stopped arriving for
+    # a fortnight because a state file was busy for one moment.
+    last: Optional[OSError] = None
+    for attempt in range(SAVE_ATTEMPTS):
+        try:
+            tmp.replace(p)
+            logger.debug("State saved (event_id=%d)", state.event_id)
+            return
+        except PermissionError as error:
+            last = error
+            time.sleep(SAVE_RETRY_SECONDS * (attempt + 1))
+    # Still busy. The next tick writes the same state again, so losing this one
+    # costs nothing -- and raising here would kill whichever thread called us.
+    logger.warning("Could not replace state file after %d attempts: %s", SAVE_ATTEMPTS, last)
 
 
 def load_config() -> Dict[str, Any]:

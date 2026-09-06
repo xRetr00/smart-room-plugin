@@ -110,3 +110,58 @@ def test_every_owntracks_message_is_forwarded_for_history():
     client._handle_owntracks(payload, "owntracks/smart_room/iphone")
 
     report.assert_called_once_with("owntracks/smart_room/iphone", payload)
+
+
+def test_a_failing_handler_does_not_kill_the_client():
+    """paho runs callbacks on its network thread, and an escape kills it.
+
+    A `PermissionError` from an ordinary Windows file lock, raised inside the
+    ESPresense handler, unsubscribed everything at once -- OwnTracks reports
+    stopped arriving for a fortnight and nothing reported a fault, because
+    from the room's point of view nothing had failed.
+    """
+
+    class _Message:
+        topic = "espresense/rooms/smart_room/telemetry"
+        payload = b'{"ip": "192.168.1.172"}'
+
+    client, _, _, node_status = _client()
+    node_status.side_effect = PermissionError("state.json is busy")
+
+    # Must not raise: the network thread has to survive this.
+    client._on_message(None, None, _Message())
+
+    # And the next message still gets through.
+    node_status.side_effect = None
+    client._on_message(None, None, _Message())
+    assert node_status.call_count == 2
+
+
+def test_a_message_that_is_not_json_is_still_routed():
+    class _Message:
+        topic = "espresense/rooms/smart_room/status"
+        payload = b"online"
+
+    client, _, _, node_status = _client()
+    client._on_message(None, None, _Message())
+    node_status.assert_called_once_with(True, None)
+
+
+def test_marvi_can_ask_the_phone_where_it_is():
+    """The one thing missing from a system built on the phone volunteering."""
+    client, _, _, _ = _client()
+    client._owntracks_topic = "owntracks/smart_room/#"
+    client._client = MagicMock()
+    client._connected = True
+
+    assert client.ask_phone_to_report() is True
+    topic, body = client._client.publish.call_args[0]
+    assert topic == "owntracks/smart_room/iphone/cmd"
+    import json as _json
+    assert _json.loads(body) == {"_type": "cmd", "action": "reportLocation"}
+
+
+def test_it_does_not_pretend_to_ask_while_disconnected():
+    client, _, _, _ = _client()
+    client._connected = False
+    assert client.ask_phone_to_report() is False
