@@ -15,7 +15,8 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,22 @@ class TuyaController:
 
     def __init__(self, config: Dict[str, Any]):
         self._config = config
+        worker = (config.get("tuya") or {}).get("worker") or {}
+        self._socket_timeout = max(0.1, float(worker.get("timeout_seconds", 4)))
+        # tinytuya already owns connection and response retries.  Keeping a
+        # second retry loop around it made one four-second timeout occupy a
+        # worker for nearly a minute (tinytuya's default is five retries), while
+        # the poller kept enqueuing more work.  The queue eventually stayed full
+        # and a healthy bulb could never be polled again.
+        self._socket_retries = max(1, min(3, int(worker.get("retries", 1))))
+        self._socket_retry_delay = max(
+            0.0, min(1.0, float(worker.get("retry_delay_seconds", 0.1)))
+        )
+        self._operation_timeout = (
+            (self._socket_retries + 1) * self._socket_timeout
+            + self._socket_retries * self._socket_retry_delay
+            + 1.0
+        )
         self._devices: Dict[str, Any] = {}  # name -> tinytuya.Device
         self._flash_stop = threading.Event()
         self._flash_thread: Optional[threading.Thread] = None
@@ -77,9 +94,11 @@ class TuyaController:
             dev = tinytuya.Device(dev_id=dev_id, address=ip, local_key=key)
             dev.set_version(float(protocol))
             if hasattr(dev, "set_socketTimeout"):
-                dev.set_socketTimeout(
-                    float((tuya_cfg.get("worker") or {}).get("timeout_seconds", 4))
-                )
+                dev.set_socketTimeout(self._socket_timeout)
+            if hasattr(dev, "set_socketRetryLimit"):
+                dev.set_socketRetryLimit(self._socket_retries)
+            if hasattr(dev, "set_socketRetryDelay"):
+                dev.set_socketRetryDelay(self._socket_retry_delay)
             self._devices[name] = dev
             logger.info("Tuya device '%s' connected at %s", name, ip)
         except Exception as e:
@@ -90,6 +109,13 @@ class TuyaController:
         now = time.monotonic()
         if now < health["circuit_open_until"]:
             return {"success": False, "error": f"{device} circuit breaker is open", "code": "CIRCUIT_OPEN"}
+        device_lock = self._locks[device]
+        if not device_lock.acquire(blocking=False):
+            return {
+                "success": False,
+                "error": f"{device} command is still in progress",
+                "code": "DEVICE_BUSY",
+            }
         if health["circuit_open_until"] and health["consecutive_failures"] >= 3:
             # The device may have been physically powered off. Once the
             # backoff expires, discard tinytuya's old connection object before
@@ -98,28 +124,31 @@ class TuyaController:
                 self._connect_device(device)
             health["circuit_open_until"] = 0.0
         if not self._slots.acquire(blocking=False):
+            device_lock.release()
             return {"success": False, "error": "Tuya command queue is full", "code": "QUEUE_FULL"}
         health["queue_depth"] += 1
 
         def execute():
             try:
-                with self._locks[device]:
-                    retries = max(0, min(3, int(((self._config.get("tuya") or {}).get("worker") or {}).get("retries", 1))))
-                    result = None
-                    for attempt in range(retries + 1):
-                        result = operation()
-                        if result.get("success") or attempt == retries:
-                            return result
-                        time.sleep(0.2 * (2 ** attempt))
-                    return result
+                return operation()
             finally:
                 health["queue_depth"] -= 1
                 self._slots.release()
+                device_lock.release()
 
         future = self._executor.submit(execute)
         try:
-            result = future.result(timeout=timeout)
+            # The SDK retry budget is the real upper bound.  Timing out this
+            # wrapper earlier leaves the SDK call alive in the executor and is
+            # precisely how the old implementation permanently filled its
+            # queue after a few intermittent LAN failures.
+            result = future.result(timeout=max(timeout, self._operation_timeout))
         except FutureTimeout:
+            # Closing the SDK's public device socket wakes a blocked recv so
+            # this worker can release its slot instead of becoming permanent.
+            active = self._devices.get(device)
+            if active is not None and hasattr(active, "close"):
+                active.close()
             result = {"success": False, "error": f"{device} command timed out", "code": "DEVICE_TIMEOUT"}
         health["last_command"] = command
         if result.get("success"):

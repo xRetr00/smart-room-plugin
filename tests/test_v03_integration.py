@@ -15,16 +15,22 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from plugins.smart_room import process_manager
-from plugins.smart_room.bridge import call_runtime
-from plugins.smart_room.bridge import build_context_line
+from plugins.smart_room.bridge import build_context_line, call_runtime
 from plugins.smart_room.runtime.app import Runtime
-from plugins.smart_room.runtime.models import MmWaveState, PhoneLocation, Presence, RoomState
+from plugins.smart_room.runtime.models import (
+    MmWaveState,
+    PhoneLocation,
+    Presence,
+    RoomState,
+)
 from plugins.smart_room.runtime.presence_fusion import fuse
 from plugins.smart_room.runtime.scheduler import Scheduler
-from plugins.smart_room.runtime.state_store import append_location_report, append_transition, load_location_reports
-from plugins.smart_room.runtime.state_store import save_state
+from plugins.smart_room.runtime.state_store import (
+    append_location_report,
+    load_location_reports,
+    save_state,
+)
 from plugins.smart_room.tools import handle_smart_room_state
 
 
@@ -487,7 +493,6 @@ def test_runtime_has_no_memory_writer_imports():
 
 
 def test_tuya_v35_bulb_uses_standard_hsv_dps(monkeypatch):
-    from types import SimpleNamespace
     from plugins.smart_room.runtime.tuya import controller
 
     class Device:
@@ -517,6 +522,100 @@ def test_tuya_v35_bulb_uses_standard_hsv_dps(monkeypatch):
     }
     assert room.set_light(on=True, brightness=40, rgb=[255, 0, 0])["dps"] == expected
     assert Device.values == expected
+
+
+def test_tuya_retries_are_bounded_by_the_sdk_without_filling_the_worker_queue(
+    monkeypatch,
+):
+    from plugins.smart_room.runtime.tuya import controller
+
+    class Device:
+        instance = None
+
+        def __init__(self, **_kwargs):
+            Device.instance = self
+            self.status_calls = 0
+            self.socket_timeout = None
+            self.retry_limit = None
+            self.retry_delay = None
+
+        def set_version(self, _version):
+            pass
+
+        def set_socketTimeout(self, seconds):
+            self.socket_timeout = seconds
+
+        def set_socketRetryLimit(self, retries):
+            self.retry_limit = retries
+
+        def set_socketRetryDelay(self, seconds):
+            self.retry_delay = seconds
+
+        def status(self):
+            self.status_calls += 1
+            return {"Error": "timed out"}
+
+    monkeypatch.setattr(controller, "HAS_TINYTUYA", True)
+    monkeypatch.setattr(controller, "tinytuya", SimpleNamespace(Device=Device))
+    monkeypatch.setenv("SMART_ROOM_TUYA_BULB_KEY", "test-key")
+    room = controller.TuyaController(
+        {
+            "tuya": {
+                "bulb": {
+                    "ip": "192.0.2.1",
+                    "device_id": "bulb",
+                    "protocol": "3.5",
+                },
+                "worker": {"timeout_seconds": 0.25, "retries": 1},
+            }
+        }
+    )
+    try:
+        result = room.get_light_status()
+
+        assert result["success"] is False
+        assert Device.instance.status_calls == 1
+        assert Device.instance.socket_timeout == 0.25
+        assert Device.instance.retry_limit == 1
+        assert Device.instance.retry_delay == 0.1
+        assert room.health()["bulb"]["queue_depth"] == 0
+    finally:
+        room.stop()
+
+
+def test_tuya_does_not_enqueue_behind_a_stuck_command():
+    from plugins.smart_room.runtime.tuya import controller
+
+    room = controller.TuyaController({})
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocked():
+        started.set()
+        release.wait(2)
+        return {"success": True}
+
+    first_result = []
+    first = threading.Thread(
+        target=lambda: first_result.append(room._run("bulb", "first", blocked)),
+        daemon=True,
+    )
+    try:
+        first.start()
+        assert started.wait(1)
+
+        second = room._run("bulb", "second", lambda: {"success": True})
+
+        assert second["code"] == "DEVICE_BUSY"
+        assert room.health()["bulb"]["queue_depth"] == 1
+        release.set()
+        first.join(1)
+        assert first_result == [{"success": True}]
+        assert room.health()["bulb"]["queue_depth"] == 0
+    finally:
+        release.set()
+        first.join(1)
+        room.stop()
 
 
 def test_tuya_reconnects_after_the_circuit_breaker_backoff(monkeypatch):
