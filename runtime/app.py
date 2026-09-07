@@ -1499,6 +1499,19 @@ class Runtime:
             "vision": self._vision.status() if self._vision else self._state.vision.__dict__.copy(),
         }
 
+    def set_low_power(self, easy: bool) -> Dict[str, Any]:
+        """Pace the room down for a game, or bring it back up.
+
+        Only the camera today, because that is where the work is: the capture
+        loop reads every frame the device produces and MediaPipe runs on top of
+        it. Everything else here waits on MQTT or a timer and costs nothing to
+        leave alone.
+        """
+        if not self._vision:
+            return {"success": True, "low_power": easy, "vision": "unavailable"}
+        self._vision.pace(easy)
+        return {"success": True, "low_power": easy, "vision": "paced"}
+
     def vision_observe(self) -> Dict[str, Any]:
         if not self._vision:
             return {"success": False, "error": "vision worker is unavailable"}

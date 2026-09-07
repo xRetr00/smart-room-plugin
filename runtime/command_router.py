@@ -162,6 +162,16 @@ class CommandRouter:
     def _handle_refresh_devices(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return self._runtime.refresh_devices()
 
+    def _handle_set_low_power(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Stand the camera down while a game has the machine, or bring it back.
+
+        Sent by the Gateway when `focus` sees a demanding app arrive or leave.
+        The room is the only part of Marvi that works hard when nobody is
+        asking it anything, so it is the part that has to be told.
+        """
+        easy = bool(params.get("low_power", params.get("easy", False)))
+        return self._runtime.set_low_power(easy)
+
     def _handle_vision_observe(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return self._runtime.vision_observe()
 

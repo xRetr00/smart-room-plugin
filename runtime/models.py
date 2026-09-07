@@ -149,6 +149,8 @@ class VisionState:
     gesture: Optional[str] = None
     gesture_confidence: float = 0.0
     sleep_state: str = "unknown"  # unknown | awake | resting
+    #: Paced down because something else needs the machine. See `VisionWorker.pace`.
+    low_power: bool = False
     stale: bool = True
     error: Optional[str] = None
     face_model: str = "buffalo_l"

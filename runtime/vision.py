@@ -66,6 +66,17 @@ CREATE INDEX IF NOT EXISTS sightings_unreported ON sightings(reported, status);
 """
 
 
+#: How long to wait between frames while standing aside. The camera stays
+#: open and the loop keeps the pipeline drained; it just stops taking every
+#: frame the device offers.
+EASY_FRAME_GAP = 0.5
+
+#: And how long between analyses. One a second is right for a room being
+#: watched; one every twenty seconds is enough to keep knowing somebody is
+#: there, which is all that is needed while they are busy.
+EASY_INFERENCE_GAP = 20.0
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -545,6 +556,36 @@ class VisionWorker:
         self._latest_embeddings: list[list[float]] = []
         self._last_gesture: Optional[str] = None
         self._last_gesture_at = 0.0
+        #: Set while something else should have the machine. See `pace`.
+        self._easy = threading.Event()
+
+    def pace(self, easy: bool) -> None:
+        """Slow right down while something else needs the machine, or resume.
+
+        The camera loop is the most expensive thing in this process and the
+        least interruptible: `capture.read()` runs with no delay at all, so it
+        pulls and copies every frame the device produces, and MediaPipe runs
+        face detection and pose landmarks on top of that once a second. That is
+        the correct cost when the room is what matters. It is the wrong cost
+        during a match, where the same core is drawing a stadium.
+
+        Slowed rather than stopped, deliberately. The camera stays open --
+        reopening a DSHOW device costs seconds and sometimes fails outright --
+        and presence keeps updating, just at a pace that suits a game. She
+        should still know you are in the room while you are playing; she does
+        not need to know it thirty times a second.
+        """
+        if easy == self._easy.is_set():
+            return
+        if easy:
+            self._easy.set()
+        else:
+            self._easy.clear()
+        with self._lock:
+            self.state.low_power = easy
+        logger.info("Vision %s", "standing down; something else needs the machine"
+                    if easy else "back to its normal pace")
+        self.publish_state(self.snapshot_state())
 
     def start(self) -> None:
         if not self.state.enabled or (self._thread and self._thread.is_alive()):
@@ -785,15 +826,23 @@ class VisionWorker:
         import cv2
         import numpy as np
 
-        interval = 1.0 / max(0.2, min(float(self.config.get("inference_fps", 1.0)), 8.0))
+        normal = 1.0 / max(0.2, min(float(self.config.get("inference_fps", 1.0)), 8.0))
         motion_threshold = max(0.0, float(self.config.get("motion_threshold", 6.0)))
         last_inference = 0.0
         previous = None
         while not self._stop.is_set():
+            easy = self._easy.is_set()
+            if easy:
+                # Between frames rather than spinning on the device. Waiting on
+                # `_stop` rather than sleeping so a shutdown is still prompt.
+                self._stop.wait(EASY_FRAME_GAP)
+                if self._stop.is_set():
+                    return
             ok, frame = capture.read()
             if not ok:
                 raise RuntimeError("camera stopped returning frames")
             now = time.monotonic()
+            interval = EASY_INFERENCE_GAP if easy else normal
             with self._lock:
                 self._latest_frame = frame
                 self.state.last_frame_at = _now_iso()
