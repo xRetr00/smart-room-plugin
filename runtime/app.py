@@ -693,8 +693,20 @@ class Runtime:
         try:
             empty_at = datetime.fromisoformat(str(empty_since).replace("Z", "+00:00"))
             empty_seconds = (datetime.now(timezone.utc) - empty_at.astimezone(timezone.utc)).total_seconds()
+            # Five minutes, not an hour.
+            #
+            # `reset_after_seconds` defaulted to 3600, so the room had to have
+            # been empty for a *whole hour* before an arrival counted as one.
+            # In practice: 147 `room_entry` events and 9 welcomes. Somebody who
+            # steps out for coffee and comes back is not welcomed, and that is
+            # most arrivals -- so the feature looked broken because for almost
+            # every real arrival it did nothing.
+            #
+            # Five minutes still does the job it was built for, which is not
+            # saying "welcome back" every time somebody crosses the sensor's
+            # edge while sitting at their desk.
             should_welcome = bool(welcome.get("enabled", True)) and empty_seconds >= max(
-                60, int(welcome.get("reset_after_seconds", 3600))
+                60, int(welcome.get("reset_after_seconds", 300))
             )
         except (TypeError, ValueError):
             pass

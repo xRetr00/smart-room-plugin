@@ -494,11 +494,24 @@ class LocalVisionAnalyzer:
 
     @staticmethod
     def _posture(poses: list[Any]) -> str:
+        """Upright, horizontal, or not visible. One frame's opinion only.
+
+        The caller must not act on a single frame of this. Pose landmarks are
+        noisy and the threshold below is a ratio, so somebody sitting at the
+        edge of it flips between answers every inference -- and every flip was
+        a state change, and every state change was an event.
+        `vision_sleep_state` reached 626 of the mind's events and 94% of
+        everything the room sent, which is that flapping and nothing else.
+        See `_settled_posture`.
+        """
         if not poses:
+            # Not visible is not asleep. It is not any posture at all -- the
+            # room is empty, or they are out of frame, or the light is off.
             return "unknown"
         # Shoulder midpoint to hip midpoint is normally vertical when upright.
-        # A mostly horizontal torso is reported as resting, never definitively
-        # asleep; room mode and sustained stillness decide how Marvi phrases it.
+        # A mostly horizontal torso is reported as resting, never as asleep:
+        # lying down is a posture and sleeping is a conclusion, and the camera
+        # can only see the first.
         pose = poses[0]
         shoulder_x = (pose[11].x + pose[12].x) / 2
         shoulder_y = (pose[11].y + pose[12].y) / 2
@@ -554,6 +567,10 @@ class VisionWorker:
         #: The open camera, so a photograph can ask it for a bigger frame.
         self._capture: Any = None
         self._latest_embeddings: list[list[float]] = []
+        #: How many inferences in a row agreed, and what they agreed on.
+        #: See `_settled_posture`.
+        self._posture_seen: str = "unknown"
+        self._posture_runs: int = 0
         self._last_gesture: Optional[str] = None
         self._last_gesture_at = 0.0
         #: Set while something else should have the machine. See `pace`.
@@ -586,6 +603,30 @@ class VisionWorker:
         logger.info("Vision %s", "standing down; something else needs the machine"
                     if easy else "back to its normal pace")
         self.publish_state(self.snapshot_state())
+
+    #: How many inferences in a row must agree before the posture changes.
+    #:
+    #: Three, at one inference a second -- so a real change is reported within
+    #: about three seconds, and a landmark jittering across the threshold is
+    #: reported not at all. Without it every jitter was a state change and
+    #: every state change was an event: `vision_sleep_state` was 94% of
+    #: everything the room ever sent.
+    STEADY_POSTURES = 3
+
+    def _settled_posture(self, seen: str) -> str:
+        """The posture, once the camera has stopped changing its mind.
+
+        Returns the currently held posture until a new one has been seen
+        `STEADY_POSTURES` times running, so a single odd frame changes nothing.
+        """
+        if seen == self._posture_seen:
+            self._posture_runs = 0
+            return self._posture_seen
+        self._posture_runs += 1
+        if self._posture_runs < self.STEADY_POSTURES:
+            return self._posture_seen
+        self._posture_seen, self._posture_runs = seen, 0
+        return seen
 
     def start(self) -> None:
         if not self.state.enabled or (self._thread and self._thread.is_alive()):
@@ -993,7 +1034,7 @@ class VisionWorker:
                 },
             )
 
-        sleep_state = str(analysis.get("sleep_state") or "unknown")
+        sleep_state = self._settled_posture(str(analysis.get("sleep_state") or "unknown"))
         person_count = max(int(analysis.get("person_count") or 0), len(embeddings))
         with self._lock:
             previous_sleep = self.state.sleep_state
