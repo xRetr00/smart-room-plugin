@@ -715,7 +715,25 @@ class Runtime:
             self._pending_welcome_timer.cancel()
         self._pending_entry_at = now_iso()
         self._pending_entry_should_welcome = should_welcome
-        delay = max(0, int(welcome.get("identity_grace_seconds", 4)))
+        # Long enough for the camera to get a look at them.
+        #
+        # Four seconds was not. The mmWave trips at the door and the face is
+        # what identifies somebody -- `_classify_entry` consults the camera
+        # first and everything else is a fallback -- and four seconds after
+        # crossing the threshold most people are not yet in front of the lens.
+        #
+        # The evidence for that is every welcome ever sent: nine of them, all
+        # nine classified "guest" or "unidentified", while `room_entry` said
+        # "Owner entered the room" 147 times at other moments. The classifier
+        # works; it was being asked too early.
+        #
+        # There is a second reason it could never succeed, now fixed above. A
+        # welcome required the room to have been empty for `reset_after_seconds`
+        # (3600) and the owner fallback requires a sighting inside
+        # `owner_evidence_window_seconds` (3600) -- so by construction, any
+        # arrival new enough to deserve a welcome was too old to be recognised
+        # as the owner by anything but the camera or BLE.
+        delay = max(0, int(welcome.get("identity_grace_seconds", 12)))
         self._pending_welcome_timer = threading.Timer(delay, self._deliver_welcome)
         self._pending_welcome_timer.daemon = True
         self._pending_welcome_timer.start()
