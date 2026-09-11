@@ -328,6 +328,10 @@ class Runtime:
                 "room_entry",
                 "room_welcome",
                 "visitor_report",
+                # The photographs. Emitted since the burst was written and
+                # never recorded here, so nothing downstream ever saw one:
+                # eight bursts on 11 September, zero popups.
+                "visitor_photos",
                 "alarm_requested",
                 "vision_visitor_seen",
                 "vision_gesture",
@@ -743,6 +747,21 @@ class Runtime:
         with self._state_lock:
             if not self._state.mmwave.occupied:
                 return
+            if self._state.modes.active_mode == "sleep":
+                # The sleeper moved. mmWave loses somebody lying still, and
+                # finds them again when they turn over -- which is an
+                # "arrival" to everything below. On 11 September that was
+                # seventeen "Unidentified entered the room" between 05:18 and
+                # 14:19, each photographed in the dark, spoken or texted, and
+                # queued as a visitor for the next report. Nobody came in.
+                #
+                # A real intruder in a dark room is not something the mmWave
+                # could tell apart from this anyway; the camera's own unknown-
+                # face path still runs and is the one that can.
+                self._pending_entry_at = None
+                self._pending_entry_should_welcome = False
+                logger.info("Occupancy resumed in sleep mode; treated as the sleeper moving")
+                return
             entry_at = self._pending_entry_at or now_iso()
             should_welcome = self._pending_entry_should_welcome and self._state.modes.active_mode != "sleep"
             self._pending_entry_at = None
@@ -933,6 +952,23 @@ class Runtime:
             self._state.location.last_geofence_at, entry_at, window
         )
 
+        # Nothing has said he left. mmWave drops somebody sitting or lying
+        # still and picks them up again when they move, so "the room went
+        # empty, then somebody came in" is usually the owner who never went
+        # anywhere. The phone is the only thing that reports a departure, and
+        # its last word is older than the last time the owner was identified
+        # here -- so as far as any sensor knows, he is still in the room.
+        #
+        # This is what turned every fidget into "you have company, someone is
+        # in the room" while he sat at his desk: eight times on 10 September
+        # as "guest", then as "unidentified" once the geofence went stale.
+        # The ceiling: an owner who leaves without his phone and a stranger
+        # who then walks in reads as the owner here. The camera's unknown-
+        # face path does not go through this and still catches that.
+        if not geofence_fresh and self._owner_never_left():
+            self._state.last_owner_seen_at = entry_at
+            return "owner", "no_departure_since_owner_seen"
+
         if not self._state.location.home:
             if not geofence_fresh:
                 # "Away", from a reading old enough to mean nothing. Somebody
@@ -958,6 +994,20 @@ class Runtime:
             self._state.last_owner_seen_at = entry_at
             return "owner", "recent_owner"
         return "guest", "phone_home_without_recent_owner_evidence"
+
+    def _owner_never_left(self) -> bool:
+        """The owner was identified after the phone's last report, if any."""
+        seen = self._state.last_owner_seen_at
+        if not seen:
+            return False
+        phone = self._state.location.last_geofence_at
+        if not phone:
+            return True
+        try:
+            parse = lambda value: datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parse(phone) <= parse(seen)
+        except (TypeError, ValueError):
+            return False
 
     def test_welcome(self, audience: str) -> None:
         """Generate a real welcome preview without changing arrival state."""

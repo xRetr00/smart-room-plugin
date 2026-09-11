@@ -250,3 +250,44 @@ def test_asking_says_so_when_mqtt_is_down() -> None:
     answer = router.dispatch("ask_phone", {})
     assert answer["status"] == "failed"
     assert "not connected" in answer["error"]
+
+
+def test_the_owner_who_never_left_is_still_the_owner() -> None:
+    """mmWave lost him sitting still and found him again when he moved.
+
+    The phone's last word predates the last time he was identified in the
+    room, so nothing has reported him leaving. On 10 September this was
+    "you have company, someone is in the room", eight times, at his own desk.
+    """
+    runtime = _runtime(home=False, last_geofence_at=_at(600))
+    runtime._state.last_owner_seen_at = _at(240)
+
+    assert runtime._classify_entry(_at()) == ("owner", "no_departure_since_owner_seen")
+
+
+def test_a_phone_that_left_after_he_was_seen_still_counts() -> None:
+    # The ceiling of the rule above: a departure the phone did report wins.
+    runtime = _runtime(home=False, last_geofence_at=_at(90), battery_percent=80)
+    runtime._state.last_owner_seen_at = _at(240)
+
+    assert runtime._classify_entry(_at())[0] == "unidentified"
+
+
+def test_turning_over_in_sleep_mode_is_not_an_arrival(monkeypatch) -> None:
+    """Seventeen "Unidentified entered the room" in one night of sleep mode.
+
+    Each one was photographed in the dark, spoken or texted, and queued as a
+    visitor for the next report. Nobody came in.
+    """
+    runtime = _runtime(home=False, last_geofence_at="2026-08-24T21:46:54+00:00")
+    runtime._state.modes.active_mode = "sleep"
+    runtime._pending_entry_at = _at()
+    emitted = MagicMock()
+    monkeypatch.setattr(runtime, "_emit_event", emitted)
+    runtime._vision = MagicMock()
+
+    runtime._deliver_welcome()
+
+    emitted.assert_not_called()
+    runtime._vision.photograph.assert_not_called()
+    assert runtime._state.unreported_visitor_entries == []
