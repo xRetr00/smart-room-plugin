@@ -25,11 +25,42 @@ from .paths import vision_home, vision_models_home
 
 logger = logging.getLogger(__name__)
 
-OWNER_THRESHOLD = 0.42
-KNOWN_THRESHOLD = 0.38
+# Measured on the owner's own library, 11 September: each of his 120 samples
+# matched against the other 119 scores 0.404 at the median and 0.368 at the
+# tenth percentile, while the best any other enrolled person reached against
+# him was 0.271. At 0.42 more than half of his own face was "unknown", which is
+# where nearly every "unknown visitor" came from.
+OWNER_THRESHOLD = 0.36
+KNOWN_THRESHOLD = 0.36
+#: Below this, a face is confidently nobody known, and only then a visitor.
+#:
+#: Between here and the match thresholds is "could not tell": the owner looking
+#: down, turned half away, badly lit. Recording those as strangers is what put
+#: his own face in the visitor queue, and then -- once approved -- side-on
+#: glimpses of him into his own library, where they made matching worse.
+STRANGER_CEILING = 0.30
+#: How far off the camera a face may point and still be judged at all. The
+#: nose's position between the eyes, 0 to 1; 0.5 is looking straight at it.
+FRONTAL_SPAN = (0.2, 0.8)
+#: Owner samples further than this from the rest are not him, or not usably.
+#:
+#: The owner's library had three below it on 11 September, all side profiles
+#: approved from the visitor queue. Removing them kept his own recognition at
+#: 91% and moved the closest stranger further away.
+OUTLIER_FLOOR = 0.2
+#: And no more than this many. Not lower: trimming to 40 by diversity dropped
+#: his recognition from 92% to 57% -- his face varies, and each sample covers
+#: a narrow slice of it. Matching 200 vectors costs microseconds.
+LIBRARY_CAP = 200
+#: A liveness score this low, averaged over a few frames, is a photo or a
+#: screen. Deliberately strict: a real face in bad light scores low too, and
+#: the cost of being wrong is calling the owner a stranger.
+SPOOF_BELOW = 0.15
+#: Recognised by clothes for this long after the face was last recognised.
+OUTFIT_HOURS = 12.0
+OUTFIT_MATCH = 0.35
 PENDING_SIMILARITY = 0.45
 MAX_PENDING = 40
-DETECT_SIZE = (640, 640)
 
 GESTURE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/"
@@ -116,6 +147,8 @@ class FaceLibrary:
         self._db.commit()
         self._enforce_pending_limit()
         self._cleanup_orphan_thumbnails()
+        with contextlib.suppress(Exception):
+            self.curate_owner()
 
     def close(self) -> None:
         with self._lock:
@@ -201,7 +234,9 @@ class FaceLibrary:
             return {"identity": best_name, "status": "owner", "score": round(best_score, 4), "nearest": nearest}
         if best_name and best_score >= self.known_threshold:
             return {"identity": best_name, "status": "known", "score": round(best_score, 4), "nearest": nearest}
-        return {"identity": "unknown", "status": "unknown", "score": round(best_score, 4), "nearest": nearest}
+        # Near someone known but not near enough: not a stranger either.
+        status = "uncertain" if best_name and best_score >= STRANGER_CEILING else "unknown"
+        return {"identity": "unknown", "status": status, "score": round(best_score, 4), "nearest": nearest}
 
     def record_sighting(
         self,
@@ -245,6 +280,80 @@ class FaceLibrary:
             sighting_id = int(cursor.lastrowid or 0)
         self._remove_thumbnails([row["thumbnail"] for row in removed])
         return sighting_id
+
+    def curate_owner(self) -> int:
+        """Drop the owner samples that are not him, and cap the rest. Returns removed.
+
+        Backed up first, once a day: this deletes rows somebody approved by
+        hand, and an approval is not something to lose to a heuristic.
+        """
+        import numpy as np
+
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT e.id, e.vector FROM embeddings e JOIN people p ON p.id = e.person_id "
+                "WHERE p.owner = 1 ORDER BY e.id"
+            ).fetchall()
+            if len(rows) < 10:
+                return 0
+            vectors = np.array([json.loads(row["vector"]) for row in rows], dtype=np.float32)
+            vectors /= np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9)
+            centre = vectors.mean(0)
+            centre /= max(float(np.linalg.norm(centre)), 1e-9)
+            keep = [i for i in range(len(rows)) if float(vectors[i] @ centre) >= OUTLIER_FLOOR]
+            if len(keep) > LIBRARY_CAP:
+                # Farthest-point: keep the samples that cover the most ground.
+                similar = vectors[keep] @ vectors[keep].T
+                chosen = [int(np.argmax(vectors[keep] @ centre))]
+                nearest = similar[chosen[0]].copy()
+                while len(chosen) < LIBRARY_CAP:
+                    pick = int(np.argmin(nearest))
+                    chosen.append(pick)
+                    nearest = np.maximum(nearest, similar[pick])
+                keep = [keep[i] for i in chosen]
+            kept = set(keep)
+            dropped = [int(rows[i]["id"]) for i in range(len(rows)) if i not in kept]
+            if not dropped:
+                return 0
+            self._backup()
+            self._db.executemany("DELETE FROM embeddings WHERE id = ?", [(i,) for i in dropped])
+            self._db.commit()
+        logger.info("Face library: removed %d owner sample(s) that did not fit", len(dropped))
+        return len(dropped)
+
+    def _backup(self) -> None:
+        target = self.dir / f"faces.sqlite3.{datetime.now(timezone.utc):%Y%m%d}.bak"
+        if not target.exists():
+            with contextlib.suppress(Exception):
+                backup = sqlite3.connect(target)
+                self._db.backup(backup)
+                backup.close()
+
+    #: At most one new owner sample this often, however good the frames are.
+    LEARN_EVERY_SECONDS = 900.0
+    _last_learned = 0.0
+
+    def learn_owner(self, embedding: list[float], score: float) -> bool:
+        """Keep a new view of the owner, when it is clearly him and actually new.
+
+        Clearly him: it already matched on its own, from a frame the caller
+        judged good. New: its best match is below 0.75 -- a near-duplicate
+        adds nothing but weight. This is how the library keeps up with
+        lighting, a beard, glasses, without anybody approving a queue.
+        """
+        now = time.monotonic()
+        if score < self.owner_threshold or score > 0.75:
+            return False
+        if self._last_learned and now - self._last_learned < self.LEARN_EVERY_SECONDS:
+            return False
+        name = self.owner_name()
+        if not name:
+            return False
+        self._last_learned = now
+        self.enroll(name, [embedding])
+        self.curate_owner()
+        logger.info("Face library: learned a new view of the owner (score %.3f)", score)
+        return True
 
     def unreported_visitors(self) -> list[Dict[str, Any]]:
         with self._lock:
@@ -396,29 +505,86 @@ def ensure_task_models() -> Dict[str, str]:
     }
 
 
-class LocalVisionAnalyzer:
-    """InsightFace plus optional official MediaPipe Tasks models."""
+def outfit(frame: Any, landmarks: list[Any]) -> Optional[Dict[str, Any]]:
+    """What somebody is wearing: a colour histogram of the torso.
 
-    def __init__(self, *, auto_download: bool = True) -> None:
+    The answer to "who is that" when there is no face to ask -- the owner
+    turned to the wall, bent over the desk, walking away. Clothes change daily,
+    so it only ever means "the person whose face was recognised earlier today",
+    and it is only asked when no face is on offer.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = frame.shape[:2]
+    points = [landmarks[i] for i in (11, 12, 23, 24) if i < len(landmarks)]
+    if len(points) < 2:
+        return None
+    xs = [min(max(point.x, 0.0), 1.0) * width for point in points]
+    ys = [min(max(point.y, 0.0), 1.0) * height for point in points]
+    left, right, top, bottom = int(min(xs)), int(max(xs)), int(min(ys)), int(max(ys))
+    if right - left < 24:
+        return None
+    # Shoulders to hips, or to the bottom of the frame when sitting at the desk.
+    bottom = max(bottom, min(height, top + (right - left)))
+    crop = frame[top:bottom, left:right]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    histogram = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    cv2.normalize(histogram, histogram, 1.0, 0.0, cv2.NORM_L1)
+    return {"box": [left, top, right, bottom], "outfit": histogram.flatten().round(5).tolist()}
+
+
+def outfit_distance(first: list[float], second: list[float]) -> float:
+    """Bhattacharyya distance: 0 is identical, 1 is nothing in common."""
+    import cv2
+    import numpy as np
+
+    return float(
+        cv2.compareHist(np.float32(first), np.float32(second), cv2.HISTCMP_BHATTACHARYYA)
+    )
+
+
+class LocalVisionAnalyzer:
+    """The lean face engine plus optional official MediaPipe Tasks models."""
+
+    def __init__(
+        self,
+        *,
+        auto_download: bool = True,
+        detection_size: int = 320,
+        dark_luma: float = 28.0,
+        threads: int = 2,
+    ) -> None:
         self.auto_download = auto_download
         self.face_model = "buffalo_l"
         self.face_provider = "CPUExecutionProvider"
+        #: 320 unless a moving room shows nobody, then one look at 640 for a
+        #: face further from the lens. 25 ms a frame against 97.
+        self.detection_size = int(detection_size)
+        #: Below this mean brightness the frame is too dark to judge as it is.
+        self.dark_luma = float(dark_luma)
+        self.threads = threads
         self._face: Any = None
         self._gesture: Any = None
         self._pose: Any = None
         self.capabilities = {"faces": False, "gestures": False, "posture": False}
 
     def load(self) -> None:
-        from insightface.app import FaceAnalysis
+        from .face_engine import FaceEngine
 
-        face = FaceAnalysis(
-            name=self.face_model,
-            root=str(vision_models_home()),
-            providers=[self.face_provider],
+        engine = FaceEngine(
+            vision_models_home(),
+            threads=self.threads,
+            auto_download=self.auto_download,
+            fetch=_download,
         )
-        face.prepare(ctx_id=-1, det_size=DETECT_SIZE)
-        self._face = face
+        engine.load()
+        self._face = engine
         self.capabilities["faces"] = True
+        self.capabilities["quality"] = engine.quality is not None
+        self.capabilities["liveness"] = engine.liveness is not None
 
         try:
             if self.auto_download:
@@ -450,23 +616,29 @@ class LocalVisionAnalyzer:
         except Exception:
             logger.warning("MediaPipe gesture/posture models unavailable", exc_info=True)
 
-    def analyze(self, frame: Any) -> Dict[str, Any]:
+    def analyze(self, frame: Any, *, wide: bool = False) -> Dict[str, Any]:
+        from .face_engine import brighten, luma
+
         if self._face is None:
             self.load()
-        faces = [
-            {
-                "embedding": [float(value) for value in face.normed_embedding],
-                "bbox": [float(value) for value in face.bbox],
-                "detection_score": float(face.det_score),
-            }
-            for face in self._face.get(frame)
-        ]
+        brightness = luma(frame)
+        dark = brightness < self.dark_luma
+        # Judged on a lifted copy when dark: a face the detector cannot find is
+        # a face nobody can decide anything about, including whether to light
+        # the room to see it.
+        seen = brighten(frame) if dark else frame
+        faces = self._face.faces(seen, self.detection_size)
+        if not faces and wide and self.detection_size < 640:
+            faces = self._face.faces(seen, 640)
         result: Dict[str, Any] = {
             "faces": faces,
             "person_count": len(faces),
             "gesture": None,
             "gesture_confidence": 0.0,
             "sleep_state": "unknown",
+            "brightness": round(brightness, 1),
+            "dark": dark,
+            "bodies": [],
             "capabilities": dict(self.capabilities),
         }
         if self._gesture is None and self._pose is None:
@@ -475,7 +647,7 @@ class LocalVisionAnalyzer:
             import cv2
             import mediapipe as mp
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(seen, cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             if self._gesture is not None:
                 recognised = self._gesture.recognize(image)
@@ -488,6 +660,11 @@ class LocalVisionAnalyzer:
                 pose = self._pose.detect(image)
                 result["person_count"] = max(result["person_count"], len(pose.pose_landmarks))
                 result["sleep_state"] = self._posture(pose.pose_landmarks)
+                # Colour lies in a lifted dark frame, so no outfit from one.
+                if not dark:
+                    result["bodies"] = [
+                        body for body in (outfit(frame, landmarks) for landmarks in pose.pose_landmarks) if body
+                    ]
         except Exception:
             logger.debug("MediaPipe frame analysis failed", exc_info=True)
         return result
@@ -521,6 +698,92 @@ class LocalVisionAnalyzer:
         return "resting" if horizontal else "awake"
 
 
+class Track:
+    """One face followed from frame to frame, and what it has been judged to be."""
+
+    def __init__(self, box: list[float], now: float) -> None:
+        self.box = box
+        self.seen_at = now
+        self.samples: list[tuple[list[float], float]] = []
+        self.live: list[float] = []
+        self.label: Optional[str] = None
+        self.name = "unknown"
+        self.score = 0.0
+        self.recorded = False
+
+    def add(self, embedding: list[float], weight: float, live: Optional[float]) -> None:
+        self.samples = (self.samples + [(embedding, max(0.05, weight))])[-8:]
+        if live is not None:
+            self.live = (self.live + [float(live)])[-8:]
+
+    def spoofed(self) -> bool:
+        return len(self.live) >= 3 and sum(self.live) / len(self.live) < SPOOF_BELOW
+
+    def judge(self, library: "FaceLibrary", confirm: int) -> Optional[str]:
+        """The track's identity, from every good frame so far rather than this one.
+
+        Once the owner, the owner for as long as the face stays tracked: the
+        frame where he turns to the wall is the same person as the one where
+        he looked at the lens, and deciding it afresh is how his back became
+        a visitor.
+        """
+        if self.label == "owner" or not self.samples:
+            return self.label
+        import numpy as np
+
+        weights = np.array([weight for _, weight in self.samples])
+        mean = (np.array([vector for vector, _ in self.samples]) * weights[:, None]).sum(0)
+        mean /= max(float(np.linalg.norm(mean)), 1e-9)
+        verdict = library.match(mean.tolist())
+        self.score = float(verdict["score"])
+        if self.spoofed():
+            # The owner's face on a photo or a screen is exactly a visitor.
+            self.label, self.name = "unknown", "unknown"
+        elif verdict["status"] == "owner" and self.live and len(self.live) < 3:
+            # Not yet. Owner is sticky for the life of the track, so it must
+            # not be granted before liveness has had frames enough to object
+            # -- otherwise a photo held up is the owner from its first frame.
+            return None
+        elif verdict["status"] in ("owner", "known"):
+            self.label, self.name = str(verdict["status"]), str(verdict["identity"])
+        elif verdict["status"] == "unknown" and len(self.samples) >= confirm:
+            self.label, self.name = "unknown", "unknown"
+        return self.label
+
+
+class FaceTracks:
+    """Faces followed across frames by where they are."""
+
+    def __init__(self, ttl: float = 4.0) -> None:
+        self.ttl = ttl
+        self.tracks: list[Track] = []
+
+    @staticmethod
+    def _overlap(a: list[float], b: list[float]) -> float:
+        left, top = max(a[0], b[0]), max(a[1], b[1])
+        right, bottom = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, right - left) * max(0.0, bottom - top)
+        union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+        return inter / union if union > 0 else 0.0
+
+    def assign(self, faces: list[Dict[str, Any]], now: float) -> list[Track]:
+        """The track for each face, in order. New faces start new tracks."""
+        self.tracks = [track for track in self.tracks if now - track.seen_at <= self.ttl]
+        free = list(self.tracks)
+        assigned: list[Track] = []
+        for face in faces:
+            box = [float(value) for value in (face.get("bbox") or [0, 0, 0, 0])[:4]]
+            best = max(free, key=lambda track: self._overlap(track.box, box), default=None)
+            if best is None or self._overlap(best.box, box) < 0.25:
+                best = Track(box, now)
+                self.tracks.append(best)
+            else:
+                free.remove(best)
+            best.box, best.seen_at = box, now
+            assigned.append(best)
+        return assigned
+
+
 class VisionWorker:
     """Continuously owns one camera and publishes structured observations."""
 
@@ -546,8 +809,23 @@ class VisionWorker:
             max_pending=int(face_config.get("max_pending", MAX_PENDING)),
         )
         self.analyzer = analyzer or LocalVisionAnalyzer(
-            auto_download=bool(config.get("auto_download_models", True))
+            auto_download=bool(config.get("auto_download_models", True)),
+            detection_size=int(face_config.get("face_detection_size", 320)),
+            dark_luma=float(config.get("dark_brightness", 28)),
         )
+        #: Tracked for four seconds of absence -- several analyses at the
+        #: normal pace, so a face that blurs for a frame keeps its identity.
+        self.tracks = FaceTracks(ttl=float(face_config.get("track_seconds", 4.0)))
+        self.confirm_frames = int(face_config.get("confirm_frames", 3))
+        self.learn_quality = float(face_config.get("learn_quality", 0.5))
+        self.close_ratio = float(face_config.get("close_face_ratio", 0.2))
+        #: Off until measured on this camera. A real face in dim light scores
+        #: low too, and an unproven spoof check that calls the owner a photo
+        #: turns him back into a visitor. Until then its scores are logged.
+        self.enforce_liveness = bool(face_config.get("enforce_liveness", False))
+        #: What the owner is wearing, and when his face last vouched for it.
+        self._outfit: Optional[tuple[list[float], float]] = None
+        self.zones = self._read_zones(config.get("zones"))
         self.capture_factory = capture_factory
         self.state = VisionState(
             enabled=bool(config.get("enabled", False)),
@@ -891,13 +1169,20 @@ class VisionWorker:
             if now - last_inference < interval:
                 continue
             grey = cv2.cvtColor(cv2.resize(frame, (160, 120)), cv2.COLOR_BGR2GRAY)
-            motion = 100.0 if previous is None else float(
-                np.mean(np.abs(grey.astype("int16") - previous.astype("int16")))
-            )
+            difference = None if previous is None else np.abs(grey.astype("int16") - previous.astype("int16"))
+            motion = 100.0 if difference is None else float(np.mean(difference))
+            # Per zone as well as overall: movement at the door is somebody
+            # arriving, and movement only at the desk or the bed is not.
+            zone_motion = {} if difference is None or easy else self._zone_motion(difference > 25)
             previous = grey
             last_inference = now
-            analysis = self.analyzer.analyze(frame)
-            self._apply_analysis(frame, analysis, moving=motion >= motion_threshold)
+            moving = motion >= motion_threshold
+            try:
+                analysis = self.analyzer.analyze(frame, wide=moving)
+            except TypeError:
+                # An analyzer without the wide retry (tests, older builds).
+                analysis = self.analyzer.analyze(frame)
+            self._apply_analysis(frame, analysis, moving=moving, zone_motion=zone_motion)
 
     @staticmethod
     def _review_crop_bounds(
@@ -935,9 +1220,36 @@ class VisionWorker:
         except Exception:
             return None
 
+    @staticmethod
+    def _facing_camera(face: Dict[str, Any]) -> bool:
+        """Whether this face points at the lens closely enough to be judged.
+
+        A profile, the top of a head, somebody looking down at a phone: the
+        embedding of any of those says little about who it is, and every one
+        of them was being matched, failing, and filed as a visitor. The face
+        in the owner's 14:47 "unknown visitor" was the owner, from behind.
+
+        The nose's place between the eyes is the turn; its place between the
+        eyes and the mouth is the tilt. No landmarks means an analyzer that
+        does not provide them, which is judged as before rather than refused.
+        """
+        points = face.get("landmarks") or []
+        if len(points) < 5:
+            return True
+        (lx, ly), (rx, ry), (nx, ny), (ml_x, ml_y), (mr_x, mr_y) = points[:5]
+        low, high = FRONTAL_SPAN
+        across = rx - lx
+        eyes_y, mouth_y = (ly + ry) / 2, (ml_y + mr_y) / 2
+        down = mouth_y - eyes_y
+        if across <= 0 or down <= 0:
+            return False
+        return low <= (nx - lx) / across <= high and low <= (ny - eyes_y) / down <= high
+
     def _reviewable_face(self, frame: Any, face: Dict[str, Any]) -> bool:
-        """Keep partial, tiny, low-confidence and blurred faces out of review."""
+        """Keep partial, tiny, turned, low-confidence and blurred faces out of review."""
         settings = self.config.get("faces") if isinstance(self.config.get("faces"), dict) else {}
+        if not self._facing_camera(face):
+            return False
         try:
             score = float(face.get("detection_score", 1.0))
             box = [float(value) for value in face.get("bbox") or []]
@@ -974,43 +1286,77 @@ class VisionWorker:
         except Exception:
             return False
 
-    def _apply_analysis(self, frame: Any, analysis: Dict[str, Any], *, moving: bool) -> None:
+    def _apply_analysis(
+        self,
+        frame: Any,
+        analysis: Dict[str, Any],
+        *,
+        moving: bool,
+        zone_motion: Optional[Dict[str, str]] = None,
+    ) -> None:
+        now = time.monotonic()
+        faces = [face for face in analysis.get("faces") or [] if face.get("embedding")]
         identities: list[str] = []
         owner_visible = False
         owner_confidence = 0.0
+        owner_seen_by = ""
+        close_unidentified = False
         embeddings: list[list[float]] = []
         reviewable_embeddings: list[list[float]] = []
-        for face in analysis.get("faces") or []:
-            embedding = [float(value) for value in face.get("embedding") or []]
-            if not embedding:
-                continue
+        frame_height = float(frame.shape[0]) if frame is not None and hasattr(frame, "shape") else 0.0
+        someone_else = False
+        for face, track in zip(faces, self.tracks.assign(faces, now)):
+            embedding = [float(value) for value in face["embedding"]]
             embeddings.append(embedding)
+            facing = self._facing_camera(face)
             reviewable = self._reviewable_face(frame, face)
             if reviewable:
                 reviewable_embeddings.append(embedding)
-            verdict = self.library.match(embedding)
-            identities.append(str(verdict["identity"]))
-            if verdict["status"] == "owner":
-                owner_visible = True
-                owner_confidence = max(owner_confidence, float(verdict["score"]))
+            quality = face.get("quality")
+            if facing:
+                # Only a face pointed at the lens says who it is. A turned one
+                # still moves the track, so it keeps the name it already has.
+                live = face.get("live")
+                if live is not None and not self.enforce_liveness:
+                    logger.debug("Liveness observed %.3f (not enforced)", float(live))
+                    live = None
+                track.add(embedding, 1.0 if quality is None else float(quality), live)
+            label = track.judge(self.library, self.confirm_frames)
+            identities.append(track.name if label in ("owner", "known") else "unknown")
+            if label == "owner":
+                owner_visible, owner_seen_by = True, "face"
+                owner_confidence = max(owner_confidence, track.score)
+                self._learn(face, embedding, quality, facing and reviewable, track)
+            elif label in ("known", "unknown"):
+                someone_else = True
+            box = face.get("bbox") or [0, 0, 0, 0]
+            if label not in ("owner", "known") and frame_height and (box[3] - box[1]) >= frame_height * self.close_ratio:
+                close_unidentified = True
             # Known identities are live state, not a surveillance history.
-            # Persist only unknown visitors, and create a thumbnail only after
-            # that decision, avoiding a JPEG and database row every second for
-            # the owner sitting at their desk.
-            sighting_id = None
-            if verdict["status"] == "unknown" and reviewable:
+            # Persist only a confirmed stranger, once per track, from a frame
+            # good enough to look at.
+            if label == "unknown" and reviewable and not track.recorded:
+                track.recorded = True
                 sighting_id = self.library.record_sighting(
-                    str(verdict["identity"]),
-                    str(verdict["status"]),
-                    float(verdict["score"]),
-                    self._thumbnail(frame, list(face.get("bbox") or [])),
-                    embedding,
+                    "unknown", "unknown", track.score, self._thumbnail(frame, list(box)), embedding
                 )
-            if sighting_id is not None:
-                self.emit_event(
-                    "vision_visitor_seen",
-                    {"sighting_id": sighting_id, "summary": "Unknown visitor seen by Smart Room"},
-                )
+                if sighting_id is not None:
+                    self.emit_event(
+                        "vision_visitor_seen",
+                        {
+                            "sighting_id": sighting_id,
+                            "spoofed": track.spoofed(),
+                            "summary": (
+                                "A face held up to the camera -- a photo or a screen"
+                                if track.spoofed()
+                                else "Unknown visitor seen by Smart Room"
+                            ),
+                        },
+                    )
+
+        owner_visible, owner_seen_by = self._by_outfit(
+            analysis.get("bodies") or [], owner_visible, owner_seen_by, someone_else, now
+        )
 
         gesture = analysis.get("gesture")
         gesture_confidence = float(analysis.get("gesture_confidence") or 0.0)
@@ -1043,6 +1389,12 @@ class VisionWorker:
             self.state.person_count = person_count
             self.state.owner_visible = owner_visible
             self.state.owner_confidence = round(owner_confidence, 4)
+            self.state.owner_seen_by = owner_seen_by
+            self.state.close_face_unidentified = close_unidentified
+            self.state.brightness = float(analysis.get("brightness") or 0.0)
+            self.state.dark = bool(analysis.get("dark", False))
+            if zone_motion:
+                self.state.zone_motion = {**self.state.zone_motion, **zone_motion}
             self.state.identities = identities[:8]
             self.state.pending_visitors = len(self.library.unreported_visitors())
             self.state.activity = "moving" if moving else "still"
@@ -1058,6 +1410,87 @@ class VisionWorker:
                 "vision_sleep_state",
                 {"sleep_state": sleep_state, "summary": f"Vision posture: {sleep_state}"},
             )
+
+    def _learn(
+        self, face: Dict[str, Any], embedding: list[float], quality: Optional[float], good: bool, track: Track
+    ) -> None:
+        """Offer this frame to the library, when it is good enough to learn from.
+
+        Only with the quality model loaded, only from a front-on face, only
+        from a live one, and only when the frame matched the owner by itself
+        -- never on the strength of the track's earlier verdict.
+        """
+        if not good or quality is None or float(quality) < self.learn_quality or track.spoofed():
+            return
+        verdict = self.library.match(embedding)
+        if verdict["status"] == "owner":
+            self.library.learn_owner(embedding, float(verdict["score"]))
+
+    def _by_outfit(
+        self,
+        bodies: list[Dict[str, Any]],
+        owner_visible: bool,
+        seen_by: str,
+        someone_else: bool,
+        now: float,
+    ) -> tuple[bool, str]:
+        """Remember what the owner is wearing, and recognise him by it.
+
+        Learned only while his face is recognised and he is the one person in
+        view, so the outfit is certainly his. Used only when no face is on
+        offer at all -- any identified face outranks clothes -- and only for
+        one person, because two people in similar colours is exactly the case
+        a histogram cannot separate.
+        """
+        if owner_visible:
+            if len(bodies) == 1:
+                self._outfit = (list(bodies[0]["outfit"]), now)
+            return owner_visible, seen_by
+        if someone_else or len(bodies) != 1 or self._outfit is None:
+            return False, ""
+        outfit, learned_at = self._outfit
+        if now - learned_at > OUTFIT_HOURS * 3600:
+            self._outfit = None
+            return False, ""
+        if outfit_distance(outfit, bodies[0]["outfit"]) <= OUTFIT_MATCH:
+            return True, "outfit"
+        return False, ""
+
+    @staticmethod
+    def _read_zones(zones: Any) -> Dict[str, list[list[float]]]:
+        """Named polygons in 0-1 frame coordinates, from config strings or lists."""
+        found: Dict[str, list[list[float]]] = {}
+        for name, polygon in (zones or {}).items() if isinstance(zones, dict) else []:
+            try:
+                points = json.loads(polygon) if isinstance(polygon, str) else polygon
+                points = [[float(x), float(y)] for x, y in points]
+            except (TypeError, ValueError):
+                logger.warning("Ignoring vision zone %r: not a list of points", name)
+                continue
+            if len(points) >= 3:
+                found[str(name)] = points
+        return found
+
+    #: Share of a zone's pixels that must change to count as movement there.
+    ZONE_MOTION_SHARE = 0.03
+
+    def _zone_motion(self, changed: Any) -> Dict[str, str]:
+        """Which zones moved, given a boolean change mask at any resolution."""
+        import cv2
+        import numpy as np
+
+        if not self.zones or changed is None:
+            return {}
+        height, width = changed.shape[:2]
+        moved: Dict[str, str] = {}
+        for name, polygon in self.zones.items():
+            mask = np.zeros((height, width), dtype=np.uint8)
+            points = np.array([[x * (width - 1), y * (height - 1)] for x, y in polygon], dtype=np.int32)
+            cv2.fillPoly(mask, [points], 1)
+            area = int(mask.sum())
+            if area and float(changed[mask.astype(bool)].sum()) / area >= self.ZONE_MOTION_SHARE:
+                moved[name] = _now_iso()
+        return moved
 
     def _set_state(self, **changes: Any) -> None:
         with self._lock:

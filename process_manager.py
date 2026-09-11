@@ -137,8 +137,13 @@ def _pid_alive(pid: int) -> bool:
         handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
             return False
+        # Opening it is not enough: a process that has exited stays openable
+        # while anything -- our own Popen, for one -- holds a handle to it.
+        # 259 is STILL_ACTIVE.
+        code = ctypes.c_ulong()
+        answered = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
         ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        return bool(answered) and code.value == 259
     try:
         os.kill(pid, 0)
         return True
@@ -330,8 +335,16 @@ def restart() -> Dict[str, Any]:
     return start(restart_count=int(previous.get("restart_count", 0)) + 1)
 
 
+#: How long a runtime whose process is alive may go unanswered before it is
+#: treated as hung. A missed ping is not a crash: on 11 September the runtime
+#: was restarted twice in one evening while the machine was busy -- a test run,
+#: a game loading -- each time a healthy process shut down for being slow.
+UNRESPONSIVE_GRACE_SECONDS = 20.0
+
+
 def _supervise_loop() -> None:
     failures = 0
+    silent_since = 0.0
     while not _supervisor_stop.is_set():
         try:
             current = status()
@@ -346,15 +359,28 @@ def _supervise_loop() -> None:
             _log("supervisor could not read the runtime state", exc_info=True)
             current = {"alive": False}
         if current.get("alive"):
+            silent_since = 0.0
             if time.time() - float(current.get("started_at", 0)) > 60:
                 failures = 0
             _supervisor_stop.wait(2)
             continue
+        if _pid_alive(int(current.get("pid", 0) or 0)):
+            # Running, just not answering. Busy until proven hung.
+            silent_since = silent_since or time.time()
+            if time.time() - silent_since < UNRESPONSIVE_GRACE_SECONDS:
+                _supervisor_stop.wait(2)
+                continue
+            _log("runtime has not answered for %.0fs; restarting it" % (time.time() - silent_since))
+        silent_since = 0.0
         failures += 1
         if _supervisor_stop.wait(min(30, 2 ** min(failures - 1, 5))):
             break
         try:
-            start(_supervisor_config, restart_count=failures)
+            # No config: a restart runs on the file as it is now. Passing the
+            # copy taken at Gateway start wrote that copy back over the file,
+            # silently undoing every edit made since -- the door zone added on
+            # 11 September lasted two minutes.
+            start(None, restart_count=failures)
         except Exception:
             _log("supervisor could not restart the runtime", exc_info=True)
             continue

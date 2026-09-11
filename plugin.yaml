@@ -1,12 +1,13 @@
 name: smart_room
-version: 0.8.2
+version: 0.9.0
 description: "Independent smart room sidecar for Marvi — room control, presence fusion, and single-owner local vision. Native Windows, no Docker/WSL."
 author: xRetro Labs
 kind: backend
 platforms:
   - windows
 pip_dependencies:
-  - insightface>=0.7,<1
+  # No insightface: runtime/face_engine.py runs the same two models directly,
+  # without the 549 MB of PyTorch and friends its import pulled in.
   - onnxruntime>=1.17,<2
   - opencv-python-headless>=4.10,<5
   - mediapipe>=0.10,<1

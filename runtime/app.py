@@ -96,6 +96,11 @@ class Runtime:
         self._pending_welcome_timer: Optional[threading.Timer] = None
         self._pending_entry_at: Optional[str] = None
         self._pending_entry_should_welcome = False
+        #: The light is on because vision asked to see, and nobody has touched
+        #: it since. Only then may vision switch it back off.
+        self._see_light_ours = False
+        self._see_light_token = 0
+        self._seen_at = 0.0
         self._ble_detected = False
         self._ble_rssi: Optional[int] = None
         self._last_ble_seen_monotonic = 0.0
@@ -350,6 +355,85 @@ class Runtime:
             self._state.vision = vision
             self._state.last_updated = now_iso()
             save_state(self._state)
+        if vision.dark and self._wants_to_see(vision):
+            # Off the camera thread: the bulb is a network round trip.
+            threading.Thread(
+                target=self._light_to_see, name="smart_room_see_light", daemon=True
+            ).start()
+
+    # -- lighting the room to see -------------------------------------------
+
+    #: Never brighter than this in sleep mode, whatever the config says.
+    SLEEP_SEE_BRIGHTNESS = 5
+    #: And never brighter than this otherwise: enough for the camera, not a
+    #: room lit for living in.
+    SEE_BRIGHTNESS_CAP = 30
+
+    def _see_config(self) -> Dict[str, Any]:
+        vision = self._config.get("vision") or {}
+        return vision.get("see_light") if isinstance(vision.get("see_light"), dict) else {}
+
+    def _wants_to_see(self, vision: VisionState) -> bool:
+        """Whether the dark is hiding somebody the room needs to identify.
+
+        In sleep mode, one case only: a face close to the camera that cannot
+        be made out. Somebody that close to the desk at night is either the
+        owner up and about, or the one person the camera most needs to see.
+        Otherwise: an arrival being judged, or that same close face while the
+        owner is not already recognised. Not "any face it cannot name": the
+        owner watching something in the dark with his head turned is exactly
+        that, and would get the light switched on at him every few minutes.
+        """
+        with self._state_lock:
+            if self._state.light.on:
+                return False
+            if self._state.modes.active_mode == "sleep":
+                return bool(vision.close_face_unidentified)
+            return bool(
+                self._pending_entry_at
+                or (vision.close_face_unidentified and not vision.owner_visible)
+            )
+
+    def _light_to_see(self) -> bool:
+        """Light the room just enough for the camera, then give the dark back.
+
+        Sleep mode: warm yellow, 5%, no more -- enough for a face at the desk,
+        not enough to wake anybody. Otherwise low (15% by default, 30% at most).
+        Switched off again after a short hold, but only if it is still the
+        light vision turned on: anybody touching it in between makes it theirs.
+        """
+        settings = self._see_config()
+        now = time.monotonic()
+        with self._state_lock:
+            asleep = self._state.modes.active_mode == "sleep"
+            # Once per ten minutes at most, asleep or not: a light that keeps
+            # flicking on is worse than a face left unidentified.
+            cooldown = float(settings.get("cooldown_seconds", 600))
+            if self._state.light.on or (self._seen_at and now - self._seen_at < cooldown):
+                return False
+            self._seen_at = now
+            self._see_light_token += 1
+            token = self._see_light_token
+        if asleep:
+            brightness = min(int(settings.get("sleep_brightness", self.SLEEP_SEE_BRIGHTNESS)), self.SLEEP_SEE_BRIGHTNESS)
+            colour = int(settings.get("sleep_color_temp", 2200))
+            hold = float(settings.get("sleep_seconds", 30))
+        else:
+            brightness = min(int(settings.get("brightness", 15)), self.SEE_BRIGHTNESS_CAP)
+            colour = int(settings.get("color_temp", 3000))
+            hold = float(settings.get("seconds", 45))
+        logger.info("Lighting the room to see: %d%% at %dK%s", brightness, colour, " (sleep mode)" if asleep else "")
+        self.set_light(True, brightness=max(1, brightness), color_temp=colour, purpose="see")
+        timer = threading.Timer(hold, self._stop_seeing, args=(token,))
+        timer.daemon = True
+        timer.start()
+        return True
+
+    def _stop_seeing(self, token: int) -> None:
+        with self._state_lock:
+            ours = self._see_light_ours and token == self._see_light_token and self._state.light.on
+        if ours:
+            self.set_light(False, purpose="see")
 
     def _on_ble_presence(
         self, detected: bool, rssi: Optional[int], identity: Optional[str] = None
@@ -737,6 +821,12 @@ class Runtime:
         # `owner_evidence_window_seconds` (3600) -- so by construction, any
         # arrival new enough to deserve a welcome was too old to be recognised
         # as the owner by anything but the camera or BLE.
+        with self._state_lock:
+            dark = bool(getattr(self._state.vision, "dark", False))
+        if dark and self._state.modes.active_mode != "sleep":
+            # Somebody came in and the camera cannot see them. The grace
+            # period below is exactly as long as it has to light up and look.
+            threading.Thread(target=self._light_to_see, name="smart_room_see_arrival", daemon=True).start()
         delay = max(0, int(welcome.get("identity_grace_seconds", 12)))
         self._pending_welcome_timer = threading.Timer(delay, self._deliver_welcome)
         self._pending_welcome_timer.daemon = True
@@ -761,6 +851,13 @@ class Runtime:
                 self._pending_entry_at = None
                 self._pending_entry_should_welcome = False
                 logger.info("Occupancy resumed in sleep mode; treated as the sleeper moving")
+                return
+            if self._nobody_came_through_the_door(self._pending_entry_at or now_iso()):
+                # The camera watched the door the whole time and it never
+                # moved. Whoever the mmWave just found was already inside.
+                self._pending_entry_at = None
+                self._pending_entry_should_welcome = False
+                logger.info("Occupancy resumed without movement at the door; not an arrival")
                 return
             entry_at = self._pending_entry_at or now_iso()
             should_welcome = self._pending_entry_should_welcome and self._state.modes.active_mode != "sleep"
@@ -883,7 +980,17 @@ class Runtime:
             if not self._state.light.on and not asleep:
                 restored = False
                 with contextlib.suppress(Exception):
-                    self.set_light(True, brightness=80)
+                    # Low, not 80%: enough for the camera to see a face.
+                    self.set_light(
+                        True,
+                        brightness=min(int(self._see_config().get("brightness", 15)), self.SEE_BRIGHTNESS_CAP),
+                        color_temp=int(self._see_config().get("color_temp", 3000)),
+                    )
+                # The camera's exposure takes a moment to catch up with a light
+                # coming on, and the first frame was taken at once. Of the 246
+                # burst photographs on disk on 11 September, 201 are too dark
+                # to make anybody out.
+                time.sleep(2.0)
             result = self._vision.photograph()
             photos = result.get("photos") or []
             if not photos:
@@ -994,6 +1101,35 @@ class Runtime:
             self._state.last_owner_seen_at = entry_at
             return "owner", "recent_owner"
         return "guest", "phone_home_without_recent_owner_evidence"
+
+    #: How long before an arrival the door may have moved and still explain it.
+    DOOR_WINDOW_SECONDS = 120
+
+    def _nobody_came_through_the_door(self, entry_at: str) -> bool:
+        """True only when the camera could see the door and saw nothing there.
+
+        The strongest evidence the room has that an "arrival" is not one:
+        mmWave loses somebody sitting still and finds them again when they
+        move, and nothing it reports can tell that apart from a person walking
+        in. The door can. Every "not sure" answers False and leaves the old
+        rules in charge: no door zone configured, no camera, a dark frame (no
+        movement is visible in the dark), or a camera paced down for a game.
+        """
+        vision = self._state.vision
+        zones = getattr(self._vision, "zones", {}) if self._vision else {}
+        if "door" not in zones:
+            return False
+        if not vision.camera_open or vision.stale or vision.dark or vision.low_power:
+            return False
+        moved = (vision.zone_motion or {}).get("door")
+        if not moved:
+            return True
+        try:
+            then = datetime.fromisoformat(str(moved).replace("Z", "+00:00"))
+            entry = datetime.fromisoformat(str(entry_at).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return (entry - then).total_seconds() > self.DOOR_WINDOW_SECONDS
 
     def _owner_never_left(self) -> bool:
         """The owner was identified after the phone's last report, if any."""
@@ -1337,8 +1473,11 @@ class Runtime:
         flash_interval_ms: int = 500,
         transition: Optional[float] = None,
         manual: bool = False,
+        purpose: str = "",
     ) -> Dict[str, Any]:
         """Set the light state."""
+        # Any other change makes the light somebody else's again.
+        self._see_light_ours = purpose == "see" and bool(on)
         if brightness is not None and not 0 <= int(brightness) <= 100:
             raise ValueError("brightness must be between 0 and 100")
         if color_temp is not None and not 2200 <= int(color_temp) <= 6500:

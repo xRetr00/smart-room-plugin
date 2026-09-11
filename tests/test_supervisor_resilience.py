@@ -160,3 +160,57 @@ def test_a_runtime_error_response_still_reaches_the_caller(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="device not found"):
         bridge.call_runtime("ping", {})
+
+
+def _run_loop(seconds: float = 10.0) -> None:
+    finished = threading.Event()
+
+    def run() -> None:
+        process_manager._supervise_loop()
+        finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    assert finished.wait(seconds), "the supervisor loop did not finish"
+
+
+def test_a_busy_runtime_is_not_restarted_for_one_missed_ping(monkeypatch) -> None:
+    """Alive but slow is busy, not hung. It used to be shut down on the spot."""
+    restarts: list[int] = []
+    checks: list[int] = []
+
+    def status() -> dict:
+        checks.append(1)
+        if len(checks) >= 3:
+            process_manager._supervisor_stop.set()
+        return {"alive": False, "pid": 4242, "started_at": 0}
+
+    monkeypatch.setattr(process_manager, "status", status)
+    monkeypatch.setattr(process_manager, "_pid_alive", lambda pid: pid == 4242)
+    monkeypatch.setattr(process_manager, "start", lambda *_a, **_k: restarts.append(1) or {})
+    monkeypatch.setattr(process_manager._supervisor_stop, "wait", lambda _s=None: process_manager._supervisor_stop.is_set())
+    process_manager._supervisor_stop.clear()
+    try:
+        _run_loop()
+    finally:
+        process_manager._supervisor_stop.set()
+    assert restarts == [], "restarted a live runtime inside the grace period"
+
+
+def test_a_restart_never_writes_the_startup_config_back(monkeypatch) -> None:
+    """The copy taken at Gateway start overwrote every later edit to the file."""
+    calls: list[tuple] = []
+
+    def status() -> dict:
+        if calls:
+            process_manager._supervisor_stop.set()
+        return {"alive": False, "started_at": 0}
+
+    monkeypatch.setattr(process_manager, "status", status)
+    monkeypatch.setattr(process_manager, "_supervisor_config", {"vision": {"zones": {}}})
+    monkeypatch.setattr(process_manager, "start", lambda *a, **k: calls.append(a) or {})
+    process_manager._supervisor_stop.clear()
+    try:
+        _run_loop(20.0)
+    finally:
+        process_manager._supervisor_stop.set()
+    assert calls and calls[0][0] is None

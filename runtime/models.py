@@ -161,6 +161,18 @@ class VisionState:
         "gestures": False,
         "posture": False,
     })
+    #: Mean brightness of the last frame, 0-255, and whether that is too dark
+    #: to judge a face in. What decides when she may light the room to see.
+    brightness: float = 0.0
+    dark: bool = False
+    #: "face", or "outfit" when the owner was recognised by what he is wearing
+    #: because no face was on offer. Empty when the owner is not visible.
+    owner_seen_by: str = ""
+    #: A face close to the lens that could not be identified. In sleep mode it
+    #: is the one thing that may turn the light on, and only faintly.
+    close_face_unidentified: bool = False
+    #: Zone name -> when motion was last seen there, ISO. See `zones`.
+    zone_motion: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

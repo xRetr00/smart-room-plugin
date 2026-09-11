@@ -8,11 +8,20 @@
 - **Tuya LAN control**: Direct control of RGBCW bulb + HE20 sensor via tinytuya — no cloud
 - **Room automations**: Adaptive light, sleep/alarm behavior, work-return settle/cancel, evening sleep, and daily resets
 - **Sound controls**: Plugin-local quantized YAMNet detection — double clap toggles the light; triple clap enters Sleep; a lone clap is ignored
-- **Local vision**: InsightFace identity matching with quality-gated enrollment,
-  a bounded visitor-review queue, nearest-known suggestions, and automatic
-  native-aspect 4:3 context crops for identity review and automatic crop cleanup;
-  raw camera frames never leave the sidecar
-- **Visible model health**: Vision state names the InsightFace model/provider
+- **Local vision**: SCRFD + ArcFace R50 run directly on ONNX Runtime
+  (`runtime/face_engine.py`, no insightface/PyTorch: ~450 MB instead of ~1.3 GB).
+  Faces are followed across frames and judged on several good ones; only a
+  face pointed at the camera is identified; a stranger is a visitor only when
+  confidently nobody known. Optional eDifFIQA(T) quality and MiniFASNet
+  liveness (logged until `faces.enforce_liveness` is turned on). The owner is
+  also recognised by outfit when no face is visible. Bounded visitor-review
+  queue with 4:3 context crops; raw camera frames never leave the sidecar
+- **Seeing in the dark**: when the camera needs to identify somebody in a dark
+  room it lights it low (15%, capped 30%); in sleep mode only for a close face
+  it cannot identify, warm and at most 5% (`vision.see_light`)
+- **Door zone**: with `vision.zones.door` set, an mmWave "arrival" needs
+  movement at the door, so somebody already inside moving is not an entry
+- **Visible model health**: Vision state names the face model/provider
   and reports whether face inference loaded successfully
 - **Device recovery**: Background polling rebuilds stale Tuya connections after
   circuit-breaker backoff, with an immediate reconnect-and-poll RPC for the UI
