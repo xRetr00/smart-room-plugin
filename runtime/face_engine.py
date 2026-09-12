@@ -45,6 +45,28 @@ QUALITY_URL = (
 #: MiniFASNetV2, about 1.7 MB, Apache 2.0.
 LIVENESS_URL = "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV2.onnx"
 
+#: The recognisers this engine can run, by the name stored beside every
+#: embedding. Embeddings from different models are different spaces and are
+#: never compared with each other.
+#:
+#: AdaFace IR-101 is the default, from a test on the owner's own labelled faces
+#: (51 of him, 8 of two friends, all from this camera, 12 September): the gap
+#: between his weakest 10% of matches and the best friend-versus-him score was
+#: 0.126, against 0.058 for ArcFace -- more than twice the safety margin, for
+#: about 90 MB and 80 ms a face more. Kept for the case it cannot load.
+RECOGNISERS: Dict[str, Dict[str, Any]] = {
+    "adaface_ir101": {
+        "label": "AdaFace IR-101",
+        "file": "adaface_ir_101.onnx",
+        "url": "https://github.com/yakhyo/adaface-onnx/releases/download/weights/adaface_ir_101.onnx",
+        "sha256": "f2eb07d03de0af560a82e1214df799fec5e09375d43521e2868f9dc387e5a43e",
+        # AdaFace was trained on BGR; ArcFace on RGB.
+        "rgb": False,
+    },
+    "arcface_r50": {"label": "ArcFace R50", "file": None, "url": None, "sha256": None, "rgb": True},
+}
+DEFAULT_RECOGNISER = "adaface_ir101"
+
 #: The five points ArcFace was trained on, in its 112x112 crop.
 ARCFACE_POINTS = np.array(
     [
@@ -185,16 +207,17 @@ class Detector:
 
 
 class Recogniser:
-    """ArcFace R50 on WebFace600K. A unit vector per aligned face."""
+    """A unit vector per aligned face. ArcFace R50 or AdaFace IR-101."""
 
-    def __init__(self, path: Path, threads: int = 2) -> None:
+    def __init__(self, path: Path, threads: int = 2, rgb: bool = True) -> None:
         self.session = session(path, threads)
         self.input = self.session.get_inputs()[0].name
+        self.rgb = rgb
 
     def embed(self, face: np.ndarray) -> np.ndarray:
         import cv2
 
-        blob = cv2.dnn.blobFromImage(face, 1.0 / 127.5, (112, 112), (127.5, 127.5, 127.5), swapRB=True)
+        blob = cv2.dnn.blobFromImage(face, 1.0 / 127.5, (112, 112), (127.5, 127.5, 127.5), swapRB=self.rgb)
         vector = self.session.run(None, {self.input: blob})[0][0]
         return vector / max(float(np.linalg.norm(vector)), 1e-9)
 
@@ -242,6 +265,16 @@ class Liveness:
         return float(odds[1] / odds.sum())
 
 
+def _sha256(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def brighten(frame: np.ndarray) -> np.ndarray:
     """A dark frame, lifted enough for the detector to find a face in it.
 
@@ -270,9 +303,12 @@ class FaceEngine:
         threads: int = 2,
         auto_download: bool = True,
         fetch: Optional[Callable[[str, Path], Path]] = None,
+        recogniser: str = DEFAULT_RECOGNISER,
     ) -> None:
         self.root = Path(root)
         self.threads = threads
+        #: The model the embeddings come from; see `RECOGNISERS`.
+        self.model = recogniser if recogniser in RECOGNISERS else DEFAULT_RECOGNISER
         self.auto_download = auto_download
         self.fetch = fetch
         self.detector: Optional[Detector] = None
@@ -308,22 +344,62 @@ class FaceEngine:
             logger.warning("Optional face model %s unavailable; carrying on without it", name, exc_info=True)
             return None
 
+    def _recogniser_path(self, folder: Path) -> Path:
+        spec = RECOGNISERS[self.model]
+        if not spec["file"]:
+            return folder / RECOGNISER
+        path = self.root / spec["file"]
+        if not path.is_file():
+            if not (self.auto_download and self.fetch):
+                raise FileNotFoundError(f"{spec['label']} is not downloaded")
+            self.fetch(spec["url"], path)
+        if spec["sha256"] and _sha256(path) != spec["sha256"]:
+            path.unlink(missing_ok=True)
+            raise ValueError(f"{spec['label']} failed its checksum and was removed")
+        return path
+
     def load(self) -> None:
         folder = self._pack()
         self.detector = Detector(folder / DETECTOR, self.threads)
-        self.recogniser = Recogniser(folder / RECOGNISER, self.threads)
+        try:
+            path = self._recogniser_path(folder)
+        except Exception:
+            # Recognition must not go dark because the better model could not
+            # be fetched. ArcFace is already on disk, and the library keeps its
+            # embeddings, so falling back is a working room, not an empty one.
+            logger.warning("%s unavailable; using ArcFace R50", RECOGNISERS[self.model]["label"], exc_info=True)
+            self.model, path = "arcface_r50", folder / RECOGNISER
+        self.recogniser = Recogniser(path, self.threads, rgb=bool(RECOGNISERS[self.model]["rgb"]))
         self.quality = self._optional(QUALITY_URL, "ediffiqa_tiny_jun2024.onnx", Quality)
         self.liveness = self._optional(LIVENESS_URL, "MiniFASNetV2.onnx", Liveness)
 
     def describe(self) -> str:
         """What is actually loaded, for the screen. Not the pack's name:
         "buffalo_l" is five models, and this runs two of them."""
-        parts = ["ArcFace R50", "SCRFD-10G"]
+        parts = [str(RECOGNISERS[self.model]["label"]), "SCRFD-10G"]
         if self.quality:
             parts.append("eDifFIQA-T")
         if self.liveness:
             parts.append("MiniFASNetV2")
         return " · ".join(parts)
+
+    def embed_image(self, image: np.ndarray) -> Optional[list[float]]:
+        """The embedding of the largest face in a picture, or None.
+
+        For rebuilding a library from the crops on disk when the model changes.
+        """
+        import cv2
+
+        if self.detector is None or self.recogniser is None:
+            self.load()
+        if max(image.shape[:2]) < 640:
+            scale = 640 / max(image.shape[:2])
+            image = cv2.resize(image, None, fx=scale, fy=scale)
+        found = self.detector.detect(image, 640)  # type: ignore[union-attr]
+        if not found:
+            return None
+        face = max(found, key=lambda f: (f["bbox"][2] - f["bbox"][0]) * (f["bbox"][3] - f["bbox"][1]))
+        return self.recogniser.embed(align(image, np.array(face["landmarks"]))).tolist()  # type: ignore[union-attr]
 
     def faces(self, frame: np.ndarray, size: int = 320) -> list[Dict[str, Any]]:
         """Every face in the frame, with what the worker needs to judge it."""

@@ -192,6 +192,7 @@ class Runtime:
                 self._publish_vision_state,
                 self._emit_event,
             )
+            self._vision.on_person = self._welcome_known
             # Repair libraries created by the old review flow, which could
             # demote the configured owner while adding another face sample.
             self._vision.library.set_owner(self._owner_name)
@@ -921,6 +922,14 @@ class Runtime:
                 self._pending_entry_should_welcome = False
                 logger.info("Occupancy resumed without movement at the door; not an arrival")
                 return
+            if self._seen_in_bed():
+                # Lying on the bed, door shut, found again by the mmWave when
+                # they moved -- the 02:21 "visitor" on 12 September. Nobody
+                # walks in and is in bed within seconds.
+                self._pending_entry_at = None
+                self._pending_entry_should_welcome = False
+                logger.info("Occupancy resumed with the person in bed; not an arrival")
+                return
             entry_at = self._pending_entry_at or now_iso()
             should_welcome = self._pending_entry_should_welcome and self._state.modes.active_mode != "sleep"
             self._pending_entry_at = None
@@ -929,12 +938,14 @@ class Runtime:
             classification, identity_reason = self._classify_entry(entry_at)
             owner_detected = classification == "owner"
             pending_entries = list(self._state.unreported_visitor_entries) if owner_detected else []
+            who = identity_reason.split(":", 1)[1] if classification == "known_person" else ""
             if not owner_detected:
                 self._state.unreported_visitor_entries.append({
                     "at": entry_at,
                     "classification": classification,
                     "owner_phone_home": phone_home,
                     "identity_reason": identity_reason,
+                    **({"who": who} if who else {}),
                 })
                 self._state.unreported_visitor_entries = self._state.unreported_visitor_entries[-100:]
 
@@ -960,7 +971,8 @@ class Runtime:
         # Three frames rather than one: the single frame taken at the moment
         # somebody walks in is very often the back of their head, and ten
         # seconds apart covers turning round, sitting down and looking up.
-        if not owner_detected and self._vision:
+        # A friend the camera already named is not photographed like a stranger.
+        if not owner_detected and classification != "known_person" and self._vision:
             threading.Thread(
                 target=self._photograph_visitor,
                 args=(entry_at, classification),
@@ -973,7 +985,8 @@ class Runtime:
             "classification": classification,
             "identity_reason": identity_reason,
             "owner_phone_home": phone_home,
-            "summary": f"{classification.replace('_', ' ').title()} entered the room",
+            "summary": f"{who or classification.replace('_', ' ').title()} entered the room",
+            **({"who": who} if who else {}),
         })
         if owner_detected and pending_entries:
             notice = self._visitor_notice(pending_entries)
@@ -1118,6 +1131,14 @@ class Runtime:
             self._state.last_owner_seen_at = entry_at
             return "owner", "camera_recognised_owner"
 
+        # A face the camera knows, that is not the owner's: a friend.
+        known = [
+            name for name in (getattr(self._state.vision, "identities", None) or [])
+            if name and name != "unknown" and name.lower() != self._owner
+        ]
+        if known and not getattr(self._state.vision, "stale", False):
+            return "known_person", f"camera_recognised:{known[0]}"
+
         if self._ble_detected:
             self._state.last_owner_seen_at = entry_at
             return "owner", "ble"
@@ -1168,6 +1189,43 @@ class Runtime:
             self._state.last_owner_seen_at = entry_at
             return "owner", "recent_owner"
         return "guest", "phone_home_without_recent_owner_evidence"
+
+    def _seen_in_bed(self) -> bool:
+        vision = self._state.vision
+        return bool(vision.camera_open and not vision.stale and vision.place == "bed")
+
+    def _welcome_known(self, name: str) -> None:
+        """A friend the camera knows has arrived: welcome them by name.
+
+        They never were. Welcomes came only from the mmWave's empty-to-occupied
+        edge, and friends mostly walk into a room the owner is already in --
+        no edge, so no welcome, however well the camera knew them.
+        """
+        welcome = self._config.get("welcome") or {}
+        if not welcome.get("enabled", True):
+            return
+        first = name.split()[0]
+        with self._state_lock:
+            owner_here = bool(self._state.vision.owner_visible or self._state.presence.detected)
+            # An arrival already filed as "someone" in the last few minutes was them.
+            now = datetime.now(timezone.utc)
+            for entry in self._state.unreported_visitor_entries:
+                try:
+                    age = (now - datetime.fromisoformat(str(entry.get("at")).replace("Z", "+00:00"))).total_seconds()
+                except ValueError:
+                    continue
+                if age <= self.CORRECTION_SECONDS and not entry.get("who"):
+                    entry["who"], entry["classification"] = name, "known_person"
+            save_state(self._state)
+        message = f"Welcome, {first}." + ("" if owner_here else f" {self._owner_name} isn't here right now.")
+        self._emit_event("room_welcome", {
+            "audience": "friend",
+            "friend": name,
+            "owner_name": self._owner_name,
+            "owner_present": owner_here,
+            "message": message,
+            "summary": f"Welcome, {name}",
+        })
 
     #: How long before an arrival the door may have moved and still explain it.
     DOOR_WINDOW_SECONDS = 120
@@ -1278,7 +1336,7 @@ class Runtime:
             when = f"{stamp.strftime('%I:%M %p').lstrip('0')} {day}"
         except (TypeError, ValueError):
             when = "an unknown time"
-        subject = "A guest" if entry.get("classification") == "guest" else "Someone"
+        subject = entry.get("who") or ("A guest" if entry.get("classification") == "guest" else "Someone")
         extra = f" There were {len(entries)} entries in total." if len(entries) > 1 else ""
         return f"{subject} entered the room at {when} while you were away from the room.{extra}"
 

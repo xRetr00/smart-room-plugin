@@ -261,9 +261,20 @@ def test_an_arrival_needs_the_door_to_have_moved() -> None:
     assert not runtime._nobody_came_through_the_door(entry.isoformat())
 
 
-def test_unproven_liveness_never_blocks_the_owner(tmp_path) -> None:
-    """Until it is measured on this camera, a low score is logged, not acted on."""
+def test_liveness_never_judges_a_brightened_dark_frame(tmp_path) -> None:
+    """A lifted dark image looks like a print; it must not make the owner a photo."""
     worker = _worker(tmp_path)
+    try:
+        for _ in range(3):
+            state = _see(worker, _face(OWNER, live=0.02), dark=True)
+        assert state.owner_visible
+    finally:
+        worker.stop()
+
+
+def test_liveness_can_be_switched_off(tmp_path) -> None:
+    worker = _worker(tmp_path)
+    worker.enforce_liveness = False
     try:
         for _ in range(3):
             state = _see(worker, _face(OWNER, live=0.02))
@@ -337,3 +348,99 @@ def test_owner_frames_log_their_scores_for_calibration(tmp_path, caplog) -> None
         assert len(lines) == 1 and "liveness 0.40" in lines[0]
     finally:
         worker.stop()
+
+
+# -- the recogniser switch, friends, the bed -----------------------------------
+
+
+def test_a_new_model_gets_its_own_library_rebuilt_from_the_crops(tmp_path) -> None:
+    library = FaceLibrary(tmp_path / "vision")
+    crop = library.dir / "faces" / "him.jpg"
+    import cv2
+
+    cv2.imwrite(str(crop), np.full((120, 120, 3), 128, dtype=np.uint8))
+    try:
+        library.enroll("Shereef", [OWNER], owner=True)
+        sighting = library.record_sighting("unknown", "unknown", 0.1, str(crop), [0.9, 0.1])
+        library.approve(sighting, "Shereef", owner=True)
+
+        library.use_model("adaface_ir101", 0.30, 0.20)
+        assert library.samples_for() == 0
+        added = library.rebuild(lambda image: [0.0, 1.0])
+
+        assert added == {"Shereef": 1}
+        assert library.match([0.0, 1.0])["status"] == "owner"
+        assert library.owner_name() == "Shereef"
+        # The ArcFace rows are kept, unused: switching back costs nothing.
+        assert library.samples_for("arcface_r50") == 2
+        person = library.people()[0]
+        assert person["samples"] == 1 and person["model"] == "adaface_ir101"
+    finally:
+        library.close()
+
+
+def test_people_carry_what_says_how_well_they_are_known(tmp_path) -> None:
+    library = FaceLibrary(tmp_path / "vision")
+    try:
+        library.enroll("Shereef", [OWNER, [0.9, 0.1]], owner=True)
+        assert library.learn("Shereef", [0.6, 0.8], 0.6)
+        assert library.mark_seen("Shereef") is None
+        person = library.people()[0]
+        assert person["learned"] == 1 and person["last_seen"] and 0 < person["consistency"] <= 1
+    finally:
+        library.close()
+
+
+def test_a_friend_is_welcomed_when_they_arrive_and_not_again_all_evening(tmp_path) -> None:
+    worker = _worker(tmp_path)
+    worker.library.enroll("Yossif Angot", [STRANGER])
+    welcomed: list = []
+    worker.on_person = welcomed.append
+    try:
+        for _ in range(3):
+            _see(worker, _face(STRANGER))
+        assert welcomed == ["Yossif Angot"]
+        worker.tracks.tracks.clear()
+        for _ in range(3):
+            _see(worker, _face(STRANGER))
+        assert welcomed == ["Yossif Angot"], "welcomed twice in one visit"
+    finally:
+        worker.stop()
+
+
+def test_the_runtime_welcomes_a_friend_by_name() -> None:
+    runtime = _runtime("off")
+    emitted: list = []
+    runtime._emit_event = lambda kind, data: emitted.append((kind, data))
+    runtime._state.presence.detected = False
+    runtime._state.vision.owner_visible = False
+
+    runtime._welcome_known("Yossif Angot")
+
+    kind, data = emitted[-1]
+    assert kind == "room_welcome" and data["audience"] == "friend"
+    assert data["message"] == "Welcome, Yossif. Shereef isn't here right now."
+
+
+def test_a_friend_the_camera_names_is_not_a_stranger_at_the_door() -> None:
+    runtime = _runtime("off")
+    runtime._state.vision.identities = ["Yossif Angot"]
+    runtime._state.vision.stale = False
+    assert runtime._classify_entry(datetime.now(timezone.utc).isoformat()) == (
+        "known_person", "camera_recognised:Yossif Angot"
+    )
+
+
+def test_somebody_found_again_in_bed_is_not_arriving(monkeypatch) -> None:
+    runtime = _runtime("off")
+    runtime._state.mmwave.occupied = True
+    runtime._pending_entry_at = datetime.now(timezone.utc).isoformat()
+    vision = runtime._state.vision
+    vision.camera_open, vision.stale, vision.place = True, False, "bed"
+    emitted = MagicMock()
+    monkeypatch.setattr(runtime, "_emit_event", emitted)
+
+    runtime._deliver_welcome()
+
+    emitted.assert_not_called()
+    assert runtime._state.unreported_visitor_entries == []

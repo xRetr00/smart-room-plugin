@@ -264,11 +264,12 @@ def test_only_a_face_pointed_at_the_camera_is_judged() -> None:
     assert VisionWorker._facing_camera({})
 
 
-def test_a_turned_face_is_neither_a_visitor_nor_the_owner(tmp_path) -> None:
+def test_a_turned_face_is_never_a_visitor_but_can_still_be_him(tmp_path) -> None:
     """The owner's 14:47 "unknown visitor" was the owner, from behind.
 
-    And the other direction matters as much: a stranger's profile must not be
-    able to pass for the owner's.
+    A turned face may only say "this is someone known": a stranger's profile
+    is neither a visitor nor the owner, and the owner's own profile -- 33 of 40
+    live frames of him on his phone -- is recognised.
     """
     seen = []
     worker = VisionWorker(
@@ -280,7 +281,8 @@ def test_a_turned_face_is_neither_a_visitor_nor_the_owner(tmp_path) -> None:
     )
     try:
         worker.library.enroll("Shereef", [[1.0, 0.0]], owner=True)
-        for embedding in ([0.0, 1.0], [1.0, 0.0]):
+        for embedding, expected in (([0.0, 1.0], False), ([1.0, 0.0], True)):
+            worker.tracks.tracks.clear()
             worker._apply_analysis(
                 None,
                 {
@@ -294,7 +296,7 @@ def test_a_turned_face_is_neither_a_visitor_nor_the_owner(tmp_path) -> None:
                 },
                 moving=False,
             )
-            assert worker.state.owner_visible is False
+            assert worker.state.owner_visible is expected
 
         assert worker.library.unreported_visitors() == []
         assert "vision_visitor_seen" not in seen

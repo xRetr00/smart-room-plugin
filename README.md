@@ -8,8 +8,14 @@
 - **Tuya LAN control**: Direct control of RGBCW bulb + HE20 sensor via tinytuya — no cloud
 - **Room automations**: Adaptive light, sleep/alarm behavior, work-return settle/cancel, evening sleep, and daily resets
 - **Sound controls**: Plugin-local quantized YAMNet detection — double clap toggles the light; triple clap enters Sleep; a lone clap is ignored
-- **Local vision**: SCRFD + ArcFace R50 run directly on ONNX Runtime
-  (`runtime/face_engine.py`, no insightface/PyTorch: ~450 MB instead of ~1.3 GB).
+- **Local vision**: SCRFD + AdaFace IR-101 run directly on ONNX Runtime
+  (`runtime/face_engine.py`, no insightface/PyTorch: ~560 MB instead of ~1.3 GB).
+  AdaFace won a test on the owner's own faces with twice ArcFace's margin
+  between him and his friends; ArcFace R50 stays as the fallback
+  (`faces.recogniser`). Each model has its own library and thresholds; a new
+  model rebuilds its library from the reviewed crops on first start, and
+  clear frames of anyone known are learned automatically (one per person per
+  15 minutes). Friends are welcomed by name when the camera sees them arrive.
   Faces are followed across frames and judged on several good ones; only a
   face pointed at the camera is identified; a stranger is a visitor only when
   confidently nobody known. Optional eDifFIQA(T) quality and MiniFASNet

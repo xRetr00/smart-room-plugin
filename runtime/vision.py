@@ -32,6 +32,18 @@ logger = logging.getLogger(__name__)
 # where nearly every "unknown visitor" came from.
 OWNER_THRESHOLD = 0.36
 KNOWN_THRESHOLD = 0.36
+#: (match threshold, stranger ceiling) for each recogniser. Different models
+#: are different spaces; a threshold means nothing outside its own.
+#:
+#: AdaFace, from the same labelled test: at 0.30 it kept 94% of the owner's
+#: faces and accepted none of eight friend faces as him (their best was 0.22);
+#: his friends match themselves at 0.28-0.48. Below 0.20 is a stranger.
+MODEL_THRESHOLDS = {
+    "arcface_r50": (0.36, 0.30),
+    "adaface_ir101": (0.30, 0.20),
+}
+#: A known person not seen for this long is arriving, and is welcomed.
+WELCOME_AFTER_HOURS = 3.0
 #: Below this, a face is confidently nobody known, and only then a visitor.
 #:
 #: Between here and the match thresholds is "could not tell": the owner looking
@@ -150,7 +162,15 @@ class FaceLibrary:
         self._db = sqlite3.connect(self.dir / "faces.sqlite3", check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
+        self._migrate()
         self._db.commit()
+        #: Which recogniser's embeddings are matched. Set by the worker once
+        #: the engine has loaded; rows from other models stay, unused, so
+        #: switching back costs nothing.
+        self.model = "arcface_r50"
+        self.stranger_ceiling = STRANGER_CEILING
+        self._last_learned: Dict[str, float] = {}
+        self._seen_marked: Dict[str, float] = {}
         self._enforce_pending_limit()
         self._cleanup_orphan_thumbnails()
         with contextlib.suppress(Exception):
@@ -160,7 +180,72 @@ class FaceLibrary:
         with self._lock:
             self._db.close()
 
-    def enroll(self, name: str, embeddings: list[list[float]], owner: bool = False) -> Dict[str, Any]:
+    def _migrate(self) -> None:
+        """Columns added after libraries already existed. Old rows are ArcFace."""
+        wanted = {
+            "embeddings": [
+                ("model", "TEXT NOT NULL DEFAULT 'arcface_r50'"),
+                ("source", "TEXT NOT NULL DEFAULT 'enrolled'"),
+                ("at", "TEXT"),
+            ],
+            "sightings": [("model", "TEXT NOT NULL DEFAULT 'arcface_r50'")],
+            "people": [("last_seen", "TEXT")],
+        }
+        for table, columns in wanted.items():
+            have = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns:
+                if name not in have:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+
+    def use_model(self, model: str, owner_threshold: float, stranger_ceiling: float) -> None:
+        self.model = model
+        self.owner_threshold = self.known_threshold = float(owner_threshold)
+        self.stranger_ceiling = float(stranger_ceiling)
+
+    def samples_for(self, model: Optional[str] = None) -> int:
+        with self._lock:
+            return int(
+                self._db.execute(
+                    "SELECT COUNT(*) FROM embeddings WHERE model = ?", (model or self.model,)
+                ).fetchone()[0]
+            )
+
+    def rebuild(self, embed_image: Callable[[Any], Optional[list[float]]]) -> Dict[str, int]:
+        """Fill the current model's library from the face crops already on disk.
+
+        Every reviewed sighting kept its crop, so a new recogniser does not
+        mean enrolling everybody again: each crop is embedded afresh and filed
+        under the person it was approved as. What cannot be rebuilt -- samples
+        enrolled live, with no crop -- is left to be learned again, which the
+        worker does by itself from clear frames.
+        """
+        import cv2
+
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT identity, thumbnail FROM sightings WHERE status IN ('owner', 'known') "
+                "AND thumbnail IS NOT NULL"
+            ).fetchall()
+            owner = self.owner_name()
+        self._backup()
+        added: Dict[str, int] = {}
+        for row in rows:
+            path = str(row["thumbnail"])
+            image = cv2.imread(path) if Path(path).is_file() else None
+            vector = embed_image(image) if image is not None else None
+            if vector is None:
+                continue
+            name = str(row["identity"])
+            self.enroll(name, [vector], owner=False, source="rebuilt")
+            added[name] = added.get(name, 0) + 1
+        if owner:
+            self.set_owner(owner)
+        logger.info("Face library rebuilt for %s: %s", self.model, added or "no usable crops")
+        return added
+
+    def enroll(
+        self, name: str, embeddings: list[list[float]], owner: bool = False, source: str = "enrolled"
+    ) -> Dict[str, Any]:
         clean = name.strip()[:80]
         if not clean:
             raise ValueError("a person needs a name")
@@ -185,24 +270,82 @@ class FaceLibrary:
                 )
                 person_id = int(cursor.lastrowid or 0)
                 is_owner = owner
+            stamp = _now_iso()
             self._db.executemany(
-                "INSERT INTO embeddings (person_id, vector) VALUES (?, ?)",
-                [(person_id, json.dumps(list(map(float, item)))) for item in embeddings],
+                "INSERT INTO embeddings (person_id, vector, model, source, at) VALUES (?, ?, ?, ?, ?)",
+                [
+                    (person_id, json.dumps(list(map(float, item))), self.model, source, stamp)
+                    for item in embeddings
+                ],
             )
             self._db.commit()
         return {"name": clean, "owner": is_owner, "samples": len(embeddings)}
 
     def people(self) -> list[Dict[str, Any]]:
+        """Everybody known, with what says how well they are known.
+
+        `samples` is this model's count. `learned` is how many were captured
+        automatically, `last_seen` when the camera last named them, and
+        `consistency` how alike their samples are (0-1): a library of one
+        person's face should agree with itself, and a low number is the first
+        sign that something that is not them has been filed under their name.
+        """
+        import numpy as np
+
         with self._lock:
-            rows = self._db.execute(
-                "SELECT p.name, p.owner, p.at, COUNT(e.id) AS samples FROM people p "
-                "LEFT JOIN embeddings e ON e.person_id = p.id "
-                "GROUP BY p.id ORDER BY p.owner DESC, p.name"
+            people = self._db.execute(
+                "SELECT id, name, owner, at, last_seen FROM people ORDER BY owner DESC, name"
             ).fetchall()
-        return [
-            {"name": row["name"], "owner": bool(row["owner"]), "samples": int(row["samples"]), "at": row["at"]}
-            for row in rows
-        ]
+            vectors: Dict[int, list] = {}
+            learned: Dict[int, int] = {}
+            newest: Dict[int, str] = {}
+            for row in self._db.execute(
+                "SELECT person_id, vector, source, at FROM embeddings WHERE model = ?", (self.model,)
+            ):
+                vectors.setdefault(row["person_id"], []).append(json.loads(row["vector"]))
+                if row["source"] == "learned":
+                    learned[row["person_id"]] = learned.get(row["person_id"], 0) + 1
+                if row["at"] and row["at"] > newest.get(row["person_id"], ""):
+                    newest[row["person_id"]] = row["at"]
+        result = []
+        for row in people:
+            samples = vectors.get(row["id"], [])
+            consistency = None
+            if len(samples) >= 2:
+                matrix = np.array(samples, dtype=np.float32)
+                matrix /= np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-9)
+                centre = matrix.mean(0)
+                centre /= max(float(np.linalg.norm(centre)), 1e-9)
+                consistency = round(float(np.median(matrix @ centre)), 3)
+            result.append({
+                "name": row["name"],
+                "owner": bool(row["owner"]),
+                "samples": len(samples),
+                "learned": learned.get(row["id"], 0),
+                "consistency": consistency,
+                "last_seen": row["last_seen"],
+                "newest_sample": newest.get(row["id"]),
+                "at": row["at"],
+                "model": self.model,
+            })
+        return result
+
+    def mark_seen(self, name: str) -> Optional[str]:
+        """Record that the camera named this person. Returns when it last did.
+
+        Written at most once a minute per person: it is asked on every frame.
+        """
+        now = time.monotonic()
+        with self._lock:
+            row = self._db.execute("SELECT last_seen FROM people WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                return None
+            previous = row["last_seen"]
+            if now - self._seen_marked.get(name, 0.0) >= 60:
+                self._seen_marked[name] = now
+                self._db.execute("UPDATE people SET last_seen = ? WHERE name = ?", (_now_iso(), name))
+                self._db.commit()
+        return previous
 
     def owner_name(self) -> Optional[str]:
         with self._lock:
@@ -228,7 +371,8 @@ class FaceLibrary:
         with self._lock:
             rows = self._db.execute(
                 "SELECT p.name, p.owner, e.vector FROM embeddings e "
-                "JOIN people p ON p.id = e.person_id"
+                "JOIN people p ON p.id = e.person_id WHERE e.model = ?",
+                (self.model,),
             ).fetchall()
         best_name, best_score, best_owner = "", 0.0, False
         for row in rows:
@@ -241,7 +385,7 @@ class FaceLibrary:
         if best_name and best_score >= self.known_threshold:
             return {"identity": best_name, "status": "known", "score": round(best_score, 4), "nearest": nearest}
         # Near someone known but not near enough: not a stranger either.
-        status = "uncertain" if best_name and best_score >= STRANGER_CEILING else "unknown"
+        status = "uncertain" if best_name and best_score >= self.stranger_ceiling else "unknown"
         return {"identity": "unknown", "status": status, "score": round(best_score, 4), "nearest": nearest}
 
     def record_sighting(
@@ -256,18 +400,19 @@ class FaceLibrary:
             if status == "unknown" and embedding is not None:
                 rows = self._db.execute(
                     "SELECT vector FROM sightings WHERE status = 'unknown' AND reported = 0 "
-                    "AND vector IS NOT NULL ORDER BY id DESC LIMIT ?",
-                    (self.max_pending,),
+                    "AND vector IS NOT NULL AND model = ? ORDER BY id DESC LIMIT ?",
+                    (self.model, self.max_pending),
                 ).fetchall()
                 if any(cosine(embedding, json.loads(row["vector"])) >= self.pending_similarity for row in rows):
                     return None
             cursor = self._db.execute(
-                "INSERT INTO sightings (at, identity, status, score, thumbnail, reported, vector) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO sightings (at, identity, status, score, thumbnail, reported, vector, model) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _now_iso(), identity, status, float(score), thumbnail,
                     0 if status == "unknown" else 1,
                     json.dumps(embedding) if embedding is not None else None,
+                    self.model,
                 ),
             )
             removed = self._db.execute(
@@ -298,7 +443,8 @@ class FaceLibrary:
         with self._lock:
             rows = self._db.execute(
                 "SELECT e.id, e.vector FROM embeddings e JOIN people p ON p.id = e.person_id "
-                "WHERE p.owner = 1 ORDER BY e.id"
+                "WHERE p.owner = 1 AND e.model = ? ORDER BY e.id",
+                (self.model,),
             ).fetchall()
             if len(rows) < 10:
                 return 0
@@ -335,11 +481,14 @@ class FaceLibrary:
                 self._db.backup(backup)
                 backup.close()
 
-    #: At most one new owner sample this often, however good the frames are.
+    #: At most one new sample per person this often, however good the frames are.
     LEARN_EVERY_SECONDS = 900.0
-    _last_learned = 0.0
 
     def learn_owner(self, embedding: list[float], score: float) -> bool:
+        name = self.owner_name()
+        return bool(name) and self.learn(name, embedding, score)
+
+    def learn(self, name: str, embedding: list[float], score: float) -> bool:
         """Keep a new view of the owner, when it is clearly him and actually new.
 
         Clearly him: it already matched on its own, from a frame the caller
@@ -348,23 +497,21 @@ class FaceLibrary:
         lighting, a beard, glasses, without anybody approving a queue.
         """
         now = time.monotonic()
-        if score < self.owner_threshold or score > 0.75:
+        if score < self.known_threshold or score > 0.75:
             return False
-        if self._last_learned and now - self._last_learned < self.LEARN_EVERY_SECONDS:
+        last = self._last_learned.get(name, 0.0)
+        if last and now - last < self.LEARN_EVERY_SECONDS:
             return False
-        name = self.owner_name()
-        if not name:
-            return False
-        self._last_learned = now
-        self.enroll(name, [embedding])
+        self._last_learned[name] = now
+        self.enroll(name, [embedding], source="learned")
         self.curate_owner()
-        logger.info("Face library: learned a new view of the owner (score %.3f)", score)
+        logger.info("Face library: learned a new view of %s (score %.3f)", name, score)
         return True
 
     def unreported_visitors(self) -> list[Dict[str, Any]]:
         with self._lock:
             rows = self._db.execute(
-                "SELECT id, at, identity, score, thumbnail, vector FROM sightings "
+                "SELECT id, at, identity, score, thumbnail, vector, model FROM sightings "
                 "WHERE status = 'unknown' AND reported = 0 ORDER BY id"
             ).fetchall()
         visitors = []
@@ -372,7 +519,8 @@ class FaceLibrary:
             item = dict(row)
             vector = item.pop("vector", None)
             nearest: Dict[str, Any] = {}
-            if vector:
+            # A vector from another model has no nearest in this one.
+            if vector and item.pop("model", self.model) == self.model:
                 try:
                     nearest = self.match(json.loads(vector)).get("nearest") or {}
                 except (TypeError, ValueError, json.JSONDecodeError):
@@ -404,11 +552,13 @@ class FaceLibrary:
     def approve(self, sighting_id: int, name: str, owner: bool = False) -> Dict[str, Any]:
         with self._lock:
             row = self._db.execute(
-                "SELECT vector FROM sightings WHERE id = ?", (sighting_id,)
+                "SELECT vector, model FROM sightings WHERE id = ?", (sighting_id,)
             ).fetchone()
         if row is None or not row["vector"]:
             raise ValueError(f"no stored face for sighting {sighting_id}")
-        result = self.enroll(name, [json.loads(row["vector"])], owner=owner)
+        if row["model"] != self.model:
+            raise ValueError("that face was stored by a different recognition model; it can only be rejected")
+        result = self.enroll(name, [json.loads(row["vector"])], owner=owner, source="approved")
         with self._lock:
             self._db.execute(
                 "UPDATE sightings SET identity = ?, status = ?, reported = 1 WHERE id = ?",
@@ -572,8 +722,10 @@ class LocalVisionAnalyzer:
         detection_size: int = 320,
         dark_luma: float = 28.0,
         threads: int = 2,
+        recogniser: str = "adaface_ir101",
     ) -> None:
         self.auto_download = auto_download
+        self.recogniser = recogniser
         #: Replaced by what actually loaded; see `FaceEngine.describe`.
         self.face_model = "ArcFace R50 · SCRFD-10G"
         self.face_provider = "CPUExecutionProvider"
@@ -596,6 +748,7 @@ class LocalVisionAnalyzer:
             threads=self.threads,
             auto_download=self.auto_download,
             fetch=_download,
+            recogniser=self.recogniser,
         )
         engine.load()
         self._face = engine
@@ -731,6 +884,8 @@ class Track:
         #: (quality, liveness) per front-on frame, enforced or not.
         self.observed: list[tuple[float, float]] = []
         self.calibrated = False
+        #: Whether this track's person has been noted as seen.
+        self.announced = False
 
     def add(self, embedding: list[float], weight: float, live: Optional[float]) -> None:
         self.samples = (self.samples + [(embedding, max(0.05, weight))])[-8:]
@@ -829,21 +984,28 @@ class VisionWorker:
             pending_similarity=float(face_config.get("pending_similarity", PENDING_SIMILARITY)),
             max_pending=int(face_config.get("max_pending", MAX_PENDING)),
         )
+        self.face_config = face_config
         self.analyzer = analyzer or LocalVisionAnalyzer(
             auto_download=bool(config.get("auto_download_models", True)),
             detection_size=int(face_config.get("face_detection_size", 320)),
             dark_luma=float(config.get("dark_brightness", 28)),
+            recogniser=str(face_config.get("recogniser", "adaface_ir101")),
         )
+        #: Called with a known person's name when they arrive -- seen for the
+        #: first time in `WELCOME_AFTER_HOURS`. The runtime welcomes them.
+        self.on_person: Optional[Callable[[str], None]] = None
         #: Tracked for four seconds of absence -- several analyses at the
         #: normal pace, so a face that blurs for a frame keeps its identity.
         self.tracks = FaceTracks(ttl=float(face_config.get("track_seconds", 4.0)))
         self.confirm_frames = int(face_config.get("confirm_frames", 3))
         self.learn_quality = float(face_config.get("learn_quality", 0.5))
         self.close_ratio = float(face_config.get("close_face_ratio", 0.2))
-        #: Off until measured on this camera. A real face in dim light scores
-        #: low too, and an unproven spoof check that calls the owner a photo
-        #: turns him back into a visitor. Until then its scores are logged.
-        self.enforce_liveness = bool(face_config.get("enforce_liveness", False))
+        #: On, from 40 live frames of the owner on 12 September: every one
+        #: scored 1.00 against a spoof line of 0.15. (The stored review crops
+        #: scored far lower -- recompressed JPEGs look like prints -- which is
+        #: why it stayed off until live frames could be measured.) Never on a
+        #: lifted dark frame; see `_apply_analysis`.
+        self.enforce_liveness = bool(face_config.get("enforce_liveness", True))
         #: What the owner is wearing, and when his face last vouched for it.
         self._outfit: Optional[tuple[list[float], float]] = None
         self.zones = self._read_zones(config.get("zones"))
@@ -1163,9 +1325,38 @@ class VisionWorker:
                         pass
         self._set_state(running=False, camera_open=False, stale=True)
 
+    def _prepare_library(self) -> None:
+        """Point the library at the model the engine actually loaded, rebuilding it if new.
+
+        Runs once, on the camera thread, before the first frame: loading the
+        models takes seconds and the rebuild a minute, and neither should hold
+        up the runtime's start.
+        """
+        engine = getattr(self.analyzer, "_face", None)
+        if engine is None and hasattr(self.analyzer, "load"):
+            self.analyzer.load()
+            engine = getattr(self.analyzer, "_face", None)
+        model = getattr(engine, "model", None)
+        if not model:
+            return
+        threshold, ceiling = MODEL_THRESHOLDS.get(model, (OWNER_THRESHOLD, STRANGER_CEILING))
+        if model == "arcface_r50" and "match_threshold" in self.face_config:
+            threshold = float(self.face_config["match_threshold"])
+        threshold = float(self.face_config.get(f"{model}_match_threshold", threshold))
+        self.library.use_model(model, threshold, ceiling)
+        if self.library.samples_for() == 0:
+            self.library.rebuild(engine.embed_image)
+
     def _capture_loop(self, capture: Any) -> None:
         import cv2
         import numpy as np
+
+        if not getattr(self, "_library_ready", False):
+            try:
+                self._prepare_library()
+            except Exception:
+                logger.warning("Could not prepare the face library for the loaded model", exc_info=True)
+            self._library_ready = True
 
         normal = 1.0 / max(0.2, min(float(self.config.get("inference_fps", 1.0)), 8.0))
         motion_threshold = max(0.0, float(self.config.get("motion_threshold", 6.0)))
@@ -1350,20 +1541,32 @@ class VisionWorker:
                 reviewable_embeddings.append(embedding)
             quality = face.get("quality")
             if facing:
-                # Only a face pointed at the lens says who it is. A turned one
-                # still moves the track, so it keeps the name it already has.
+                # A face pointed at the lens can say anything about who it is,
+                # including "nobody known".
                 live = face.get("live")
                 if live is not None:
                     track.observed.append((1.0 if quality is None else float(quality), float(live)))
-                    if not self.enforce_liveness:
+                    # A dark frame is brightened before it is judged, and a
+                    # lifted image is exactly what a print looks like.
+                    if not self.enforce_liveness or analysis.get("dark"):
                         live = None
                 track.add(embedding, 1.0 if quality is None else float(quality), live)
+            else:
+                # A turned face may only say "this is someone known". With
+                # AdaFace it does that well: 33 of 40 live frames of the owner
+                # on his phone were side-on, and every one matched him at a
+                # median 0.59. It can never make a stranger or be learned from.
+                side = self.library.match(embedding)
+                if side["status"] in ("owner", "known") and float(side["score"]) >= self.library.known_threshold + 0.05:
+                    track.add(embedding, 0.5, None)
             label = track.judge(self.library, self.confirm_frames)
             identities.append(track.name if label in ("owner", "known") else "unknown")
+            if label in ("owner", "known"):
+                self._arrived(track)
+                self._learn(face, embedding, quality, facing and reviewable, track)
             if label == "owner":
                 owner_visible, owner_seen_by = True, "face"
                 owner_confidence = max(owner_confidence, track.score)
-                self._learn(face, embedding, quality, facing and reviewable, track)
                 if not track.calibrated and len(track.observed) >= 5:
                     # Once per track, from frames known to be the owner: the
                     # real distribution on this camera, which is what the
@@ -1479,8 +1682,31 @@ class VisionWorker:
         if not good or quality is None or float(quality) < self.learn_quality or track.spoofed():
             return
         verdict = self.library.match(embedding)
-        if verdict["status"] == "owner":
-            self.library.learn_owner(embedding, float(verdict["score"]))
+        # The frame on its own must name the same person the track did.
+        if verdict["status"] in ("owner", "known") and verdict["identity"] == track.name:
+            self.library.learn(track.name, embedding, float(verdict["score"]))
+
+    def _arrived(self, track: Track) -> None:
+        """Note that the camera named somebody, and say so if they are arriving."""
+        # Every frame (the library writes at most once a minute), so "last
+        # seen" stays true for somebody who sits at the desk all afternoon.
+        previous = self.library.mark_seen(track.name)
+        if track.announced:
+            return
+        track.announced = True
+        if track.label != "known" or self.on_person is None:
+            return
+        try:
+            gone = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(str(previous).replace("Z", "+00:00"))
+            ).total_seconds() if previous else float("inf")
+        except ValueError:
+            gone = float("inf")
+        if gone >= WELCOME_AFTER_HOURS * 3600:
+            try:
+                self.on_person(track.name)
+            except Exception:
+                logger.warning("Could not welcome %s", track.name, exc_info=True)
 
     def _by_outfit(
         self,
