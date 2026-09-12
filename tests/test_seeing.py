@@ -183,6 +183,18 @@ def test_curation_removes_what_is_not_him_and_keeps_a_backup(tmp_path) -> None:
         library.close()
 
 
+def test_a_new_backup_replaces_the_one_before_it(tmp_path) -> None:
+    library = FaceLibrary(tmp_path / "vision")
+    try:
+        older = tmp_path / "vision" / "faces.sqlite3.20200101.bak"
+        older.write_bytes(b"yesterday")
+        library._backup()
+        backups = list((tmp_path / "vision").glob("faces.sqlite3.*.bak"))
+        assert len(backups) == 1 and backups[0] != older
+    finally:
+        library.close()
+
+
 def test_learning_takes_only_new_clear_views_and_not_too_often(tmp_path) -> None:
     library = FaceLibrary(tmp_path / "vision")
     try:

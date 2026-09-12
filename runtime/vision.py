@@ -474,12 +474,23 @@ class FaceLibrary:
         return len(dropped)
 
     def _backup(self) -> None:
+        """One backup, from before the latest curation; the one before it goes.
+
+        A new one was written every day curation ran and none was ever
+        deleted -- 4 MB a day, forever, of copies nobody would restore past
+        the most recent.
+        """
         target = self.dir / f"faces.sqlite3.{datetime.now(timezone.utc):%Y%m%d}.bak"
-        if not target.exists():
-            with contextlib.suppress(Exception):
-                backup = sqlite3.connect(target)
-                self._db.backup(backup)
-                backup.close()
+        if target.exists():
+            return
+        with contextlib.suppress(Exception):
+            backup = sqlite3.connect(target)
+            self._db.backup(backup)
+            backup.close()
+            # Only once the new one is written: a failed backup keeps the old.
+            for older in self.dir.glob("faces.sqlite3.*.bak"):
+                if older != target:
+                    older.unlink(missing_ok=True)
 
     #: At most one new sample per person this often, however good the frames are.
     LEARN_EVERY_SECONDS = 900.0
