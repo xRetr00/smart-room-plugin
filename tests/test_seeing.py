@@ -270,3 +270,58 @@ def test_unproven_liveness_never_blocks_the_owner(tmp_path) -> None:
         assert state.owner_visible
     finally:
         worker.stop()
+
+
+# -- round two: from the first night's logs ------------------------------------
+
+
+def test_where_in_the_room_comes_from_the_zones(tmp_path) -> None:
+    worker = _worker(tmp_path, zones={"desk": [[0.2, 0.2], [0.7, 0.2], [0.7, 1.0], [0.2, 1.0]]})
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    try:
+        assert _see(worker, _face(OWNER, box=(250.0, 150.0, 350.0, 260.0)), frame=frame).place == "desk"
+        worker.tracks.tracks.clear()
+        assert _see(worker, _face(OWNER, box=(560.0, 150.0, 630.0, 260.0)), frame=frame).place == ""
+    finally:
+        worker.stop()
+
+
+def test_the_owners_face_retracts_a_visitor_he_turned_out_to_be() -> None:
+    runtime = _runtime("off")
+    just_now = datetime.now(timezone.utc)
+    runtime._state.unreported_visitor_entries = [
+        {"at": (just_now - timedelta(seconds=40)).isoformat(), "classification": "unidentified"},
+        {"at": (just_now - timedelta(hours=3)).isoformat(), "classification": "unknown_visitor"},
+    ]
+    vision = runtime._state.vision
+    vision.owner_visible, vision.owner_seen_by, vision.dark = True, "face", False
+
+    runtime._publish_vision_state(vision)
+
+    assert [entry["classification"] for entry in runtime._state.unreported_visitor_entries] == ["unknown_visitor"]
+
+
+def test_the_camera_keeps_the_room_occupied_while_it_sees_somebody() -> None:
+    runtime = _runtime("off")
+    runtime._state.mmwave.occupied = False
+    runtime._state.mmwave.last_seen = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    vision = runtime._state.vision
+    vision.camera_open, vision.stale, vision.dark = True, False, False
+    assert runtime._check_exit_timeout(), "empty room, nothing in view"
+
+    vision.identities, vision.person_count = ["Shereef"], 1
+    runtime._publish_vision_state(vision)
+    assert not runtime._check_exit_timeout(), "the mmWave lost him; the camera did not"
+
+
+def test_no_light_for_an_arrival_the_phone_already_identified() -> None:
+    runtime = _runtime("off")
+    runtime._pending_entry_at = datetime.now(timezone.utc).isoformat()
+    runtime._state.vision.dark = True
+    runtime._state.location.home = True
+    runtime._state.location.last_geofence_at = datetime.now(timezone.utc).isoformat()
+    assert not runtime._wants_to_see(runtime._state.vision)
+
+    runtime._state.location.home = False
+    runtime._state.location.last_geofence_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    assert runtime._wants_to_see(runtime._state.vision)

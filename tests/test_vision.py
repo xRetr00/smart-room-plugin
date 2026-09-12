@@ -28,7 +28,7 @@ def test_vision_state_round_trips_with_room_state() -> None:
     assert restored.vision.camera_open is True
     assert restored.vision.owner_visible is True
     assert restored.vision.activity == "moving"
-    assert restored.vision.face_model == "buffalo_l"
+    assert restored.vision.face_model == "ArcFace R50 · SCRFD-10G"
     assert restored.vision.face_model_loaded is False
 
 

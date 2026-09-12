@@ -101,6 +101,7 @@ class Runtime:
         self._see_light_ours = False
         self._see_light_token = 0
         self._seen_at = 0.0
+        self._camera_person_at = 0.0
         self._ble_detected = False
         self._ble_rssi: Optional[int] = None
         self._last_ble_seen_monotonic = 0.0
@@ -354,12 +355,68 @@ class Runtime:
         with self._state_lock:
             self._state.vision = vision
             self._state.last_updated = now_iso()
+            if vision.identities or (vision.person_count and vision.activity == "moving"):
+                # A face, or a body that moved: not a coat on a chair.
+                self._camera_person_at = time.monotonic()
+            if vision.owner_visible and vision.owner_seen_by == "face":
+                self._retract_recent_visitors()
             save_state(self._state)
         if vision.dark and self._wants_to_see(vision):
             # Off the camera thread: the bulb is a network round trip.
             threading.Thread(
                 target=self._light_to_see, name="smart_room_see_light", daemon=True
             ).start()
+
+    #: How long after an entry the owner's face may still correct it.
+    CORRECTION_SECONDS = 180
+
+    def _retract_recent_visitors(self) -> None:
+        """An arrival judged a stranger, and his face turns up a minute later.
+
+        That was him. The camera outranks the phone and the mmWave everywhere
+        else in this file, and it has to be allowed to outrank them after the
+        fact too -- otherwise "someone entered the room at 2:21 while you were
+        away" gets read out about the owner's own arrival. Caller holds the
+        state lock.
+        """
+        now = datetime.now(timezone.utc)
+        kept = []
+        for entry in self._state.unreported_visitor_entries:
+            try:
+                age = (now - datetime.fromisoformat(str(entry.get("at")).replace("Z", "+00:00"))).total_seconds()
+            except ValueError:
+                age = float("inf")
+            if age <= self.CORRECTION_SECONDS:
+                logger.info("Visitor entry at %s was the owner; the camera recognised him", entry.get("at"))
+                continue
+            kept.append(entry)
+        self._state.unreported_visitor_entries = kept
+
+    #: The camera counts as somebody being here for this long after it last
+    #: saw a face or a moving body.
+    CAMERA_OCCUPANCY_SECONDS = 90
+
+    def _camera_occupied(self) -> bool:
+        """Whether the camera, rather than the mmWave, says somebody is here.
+
+        mmWave loses a person who sits still; the camera does not. Letting it
+        hold the room occupied is what stops the fidget-and-"arrive" cycle at
+        the source: the room never went empty, so nobody entered it.
+        """
+        vision = self._state.vision
+        return bool(
+            vision.camera_open
+            and not vision.stale
+            and self._camera_person_at
+            and time.monotonic() - self._camera_person_at < self.CAMERA_OCCUPANCY_SECONDS
+        )
+
+    def _owner_evident(self) -> bool:
+        """The owner is identified without the camera: BLE, a fresh home, or never left."""
+        location = self._state.location
+        window = max(60, int((self._config.get("welcome") or {}).get("owner_evidence_window_seconds", 3600)))
+        fresh_home = location.home and self._within_seconds(location.last_geofence_at, now_iso(), window)
+        return bool(self._ble_detected or fresh_home or self._owner_never_left())
 
     # -- lighting the room to see -------------------------------------------
 
@@ -390,7 +447,7 @@ class Runtime:
             if self._state.modes.active_mode == "sleep":
                 return bool(vision.close_face_unidentified)
             return bool(
-                self._pending_entry_at
+                (self._pending_entry_at and not self._owner_evident())
                 or (vision.close_face_unidentified and not vision.owner_visible)
             )
 
@@ -823,11 +880,16 @@ class Runtime:
         # as the owner by anything but the camera or BLE.
         with self._state_lock:
             dark = bool(getattr(self._state.vision, "dark", False))
-        if dark and self._state.modes.active_mode != "sleep":
-            # Somebody came in and the camera cannot see them. The grace
-            # period below is exactly as long as it has to light up and look.
-            threading.Thread(target=self._light_to_see, name="smart_room_see_arrival", daemon=True).start()
+            # The phone or BLE already says who it is: lighting the room to
+            # look would only flick the light on at the owner. That happened
+            # three times one night, each time his phone had said "home".
+            needs_eyes = dark and self._state.modes.active_mode != "sleep" and not self._owner_evident()
         delay = max(0, int(welcome.get("identity_grace_seconds", 12)))
+        if needs_eyes:
+            threading.Thread(target=self._light_to_see, name="smart_room_see_arrival", daemon=True).start()
+            # Four seconds was the configured grace, and the camera needs
+            # longer than that after a light comes on before a face is sharp.
+            delay = max(delay, 10)
         self._pending_welcome_timer = threading.Timer(delay, self._deliver_welcome)
         self._pending_welcome_timer.daemon = True
         self._pending_welcome_timer.start()
@@ -991,6 +1053,11 @@ class Runtime:
                 # burst photographs on disk on 11 September, 201 are too dark
                 # to make anybody out.
                 time.sleep(2.0)
+            # And wait for somebody to be in frame. The 02:21 "visitor" burst
+            # was three well-lit photographs of an empty chair.
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and not self._state.vision.person_count:
+                time.sleep(0.5)
             result = self._vision.photograph()
             photos = result.get("photos") or []
             if not photos:
@@ -1243,7 +1310,7 @@ class Runtime:
     def _check_exit_timeout(self) -> bool:
         """Check whether mmWave has remained clear for the exit timeout."""
         exit_timeout = self._config.get("esp32", {}).get("exit_timeout", 60)
-        if self._state.mmwave.occupied:
+        if self._state.mmwave.occupied or self._camera_occupied():
             return False
         last_seen = self._state.mmwave.last_seen
         if last_seen is None:

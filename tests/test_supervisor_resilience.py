@@ -214,3 +214,16 @@ def test_a_restart_never_writes_the_startup_config_back(monkeypatch) -> None:
     finally:
         process_manager._supervisor_stop.set()
     assert calls and calls[0][0] is None
+
+
+def test_stopping_at_exit_with_nothing_running_touches_nothing(monkeypatch) -> None:
+    """The atexit hook, after a test already stopped everything, must be a no-op."""
+    calls: list[str] = []
+    monkeypatch.setattr(process_manager, "stop", lambda **_k: calls.append("stop") or {})
+    monkeypatch.setattr(process_manager, "_supervisor_thread", None)
+    monkeypatch.setattr(process_manager, "_supervisor_root", None)
+    monkeypatch.setattr(process_manager, "_process", None)
+
+    process_manager.stop_supervisor()
+
+    assert calls == []

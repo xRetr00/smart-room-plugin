@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import sys
+import tempfile
 import types
 
 import pytest
 
+
+# For the whole session, before anything is imported, and never put back.
+#
+# The per-test fixture below is undone after each test, and anything that runs
+# outside a test -- an atexit hook, a thread still winding down -- saw the real
+# data directory again. One such hook found the live runtime's record and token
+# at the end of every run and shut the owner's room down with them.
+os.environ["MARVI_SMART_ROOM_HOME"] = tempfile.mkdtemp(prefix="smart-room-tests-")
+os.environ.pop("MARVI_PLUGIN_DATA", None)
 
 _ROOT = Path(__file__).resolve().parents[1]
 if "plugins" not in sys.modules:

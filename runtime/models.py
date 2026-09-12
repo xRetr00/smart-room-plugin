@@ -153,7 +153,7 @@ class VisionState:
     low_power: bool = False
     stale: bool = True
     error: Optional[str] = None
-    face_model: str = "buffalo_l"
+    face_model: str = "ArcFace R50 · SCRFD-10G"
     face_model_loaded: bool = False
     face_provider: str = "CPUExecutionProvider"
     capabilities: Dict[str, bool] = field(default_factory=lambda: {
@@ -173,6 +173,8 @@ class VisionState:
     close_face_unidentified: bool = False
     #: Zone name -> when motion was last seen there, ISO. See `zones`.
     zone_motion: Dict[str, str] = field(default_factory=dict)
+    #: The zone the one person in view is in ("desk", "bed", "door"), or "".
+    place: str = ""
 
 
 @dataclass

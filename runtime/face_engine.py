@@ -315,6 +315,16 @@ class FaceEngine:
         self.quality = self._optional(QUALITY_URL, "ediffiqa_tiny_jun2024.onnx", Quality)
         self.liveness = self._optional(LIVENESS_URL, "MiniFASNetV2.onnx", Liveness)
 
+    def describe(self) -> str:
+        """What is actually loaded, for the screen. Not the pack's name:
+        "buffalo_l" is five models, and this runs two of them."""
+        parts = ["ArcFace R50", "SCRFD-10G"]
+        if self.quality:
+            parts.append("eDifFIQA-T")
+        if self.liveness:
+            parts.append("MiniFASNetV2")
+        return " · ".join(parts)
+
     def faces(self, frame: np.ndarray, size: int = 320) -> list[Dict[str, Any]]:
         """Every face in the frame, with what the worker needs to judge it."""
         if self.detector is None or self.recogniser is None:

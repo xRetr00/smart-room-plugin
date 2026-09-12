@@ -412,6 +412,13 @@ def start_supervisor(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def stop_supervisor() -> None:
     global _supervisor_config, _supervisor_root, _supervisor_thread
+    if _supervisor_thread is None and _supervisor_root is None and _process is None:
+        # Nothing of ours is running. This matters most at exit: the atexit
+        # hook runs after everything else has been torn down -- in a test run,
+        # after the sandboxed data directory has been put back -- and a stop
+        # from here then found the *real* runtime's record and token and shut
+        # the owner's room down. It happened at the end of every test run.
+        return
     _supervisor_stop.set()
     thread = _supervisor_thread
     if thread and thread is not threading.current_thread():

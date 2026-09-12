@@ -102,6 +102,12 @@ CREATE INDEX IF NOT EXISTS sightings_unreported ON sightings(reported, status);
 #: frame the device offers.
 EASY_FRAME_GAP = 0.5
 
+#: An empty, still room is looked at this often instead, after this long.
+#: Around the clock that is most of the day, and a face in a doorway still
+#: moves -- which is what brings the full rate back.
+IDLE_INFERENCE_GAP = 5.0
+IDLE_AFTER_SECONDS = 60.0
+
 #: And how long between analyses. One a second is right for a room being
 #: watched; one every twenty seconds is enough to keep knowing somebody is
 #: there, which is all that is needed while they are busy.
@@ -536,6 +542,16 @@ def outfit(frame: Any, landmarks: list[Any]) -> Optional[Dict[str, Any]]:
     return {"box": [left, top, right, bottom], "outfit": histogram.flatten().round(5).tolist()}
 
 
+def _inside(point: tuple[float, float], polygon: list[list[float]]) -> bool:
+    """Ray casting: is a 0-1 point inside a 0-1 polygon."""
+    x, y = point
+    inside = False
+    for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1]):
+        if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-9) + x1:
+            inside = not inside
+    return inside
+
+
 def outfit_distance(first: list[float], second: list[float]) -> float:
     """Bhattacharyya distance: 0 is identical, 1 is nothing in common."""
     import cv2
@@ -558,7 +574,8 @@ class LocalVisionAnalyzer:
         threads: int = 2,
     ) -> None:
         self.auto_download = auto_download
-        self.face_model = "buffalo_l"
+        #: Replaced by what actually loaded; see `FaceEngine.describe`.
+        self.face_model = "ArcFace R50 · SCRFD-10G"
         self.face_provider = "CPUExecutionProvider"
         #: 320 unless a moving room shows nobody, then one look at 640 for a
         #: face further from the lens. 25 ms a frame against 97.
@@ -582,6 +599,7 @@ class LocalVisionAnalyzer:
         )
         engine.load()
         self._face = engine
+        self.face_model = engine.describe()
         self.capabilities["faces"] = True
         self.capabilities["quality"] = engine.quality is not None
         self.capabilities["liveness"] = engine.liveness is not None
@@ -826,11 +844,12 @@ class VisionWorker:
         #: What the owner is wearing, and when his face last vouched for it.
         self._outfit: Optional[tuple[list[float], float]] = None
         self.zones = self._read_zones(config.get("zones"))
+        self._quiet_since = 0.0
         self.capture_factory = capture_factory
         self.state = VisionState(
             enabled=bool(config.get("enabled", False)),
             camera_index=int(config.get("camera_index", 0)),
-            face_model=str(getattr(self.analyzer, "face_model", "buffalo_l")),
+            face_model=str(getattr(self.analyzer, "face_model", "ArcFace R50 · SCRFD-10G")),
             face_provider=str(
                 getattr(self.analyzer, "face_provider", "CPUExecutionProvider")
             ),
@@ -1162,6 +1181,11 @@ class VisionWorker:
                 raise RuntimeError("camera stopped returning frames")
             now = time.monotonic()
             interval = EASY_INFERENCE_GAP if easy else normal
+            if not easy and self._quiet_since and now - self._quiet_since > IDLE_AFTER_SECONDS:
+                # Nobody here and nothing moving for a while: look every few
+                # seconds instead of every second. Movement brings it straight
+                # back, because motion is measured on every analysis.
+                interval = max(interval, IDLE_INFERENCE_GAP)
             with self._lock:
                 self._latest_frame = frame
                 self.state.last_frame_at = _now_iso()
@@ -1171,9 +1195,15 @@ class VisionWorker:
             grey = cv2.cvtColor(cv2.resize(frame, (160, 120)), cv2.COLOR_BGR2GRAY)
             difference = None if previous is None else np.abs(grey.astype("int16") - previous.astype("int16"))
             motion = 100.0 if difference is None else float(np.mean(difference))
+            # A light switching on changes every pixel at once, and read as
+            # movement it put "motion" in every zone -- the door included, at
+            # the very moment an automation lit the room for an arrival.
+            relit = difference is not None and (
+                abs(float(grey.mean()) - float(previous.mean())) > 12 or float((difference > 25).mean()) > 0.5
+            )
             # Per zone as well as overall: movement at the door is somebody
             # arriving, and movement only at the desk or the bed is not.
-            zone_motion = {} if difference is None or easy else self._zone_motion(difference > 25)
+            zone_motion = {} if difference is None or easy or relit else self._zone_motion(difference > 25)
             previous = grey
             last_inference = now
             moving = motion >= motion_threshold
@@ -1183,6 +1213,9 @@ class VisionWorker:
                 # An analyzer without the wide retry (tests, older builds).
                 analysis = self.analyzer.analyze(frame)
             self._apply_analysis(frame, analysis, moving=moving, zone_motion=zone_motion)
+            with self._lock:
+                empty = self.state.person_count == 0
+            self._quiet_since = (self._quiet_since or now) if (empty and not moving) else 0.0
 
     @staticmethod
     def _review_crop_bounds(
@@ -1357,6 +1390,7 @@ class VisionWorker:
         owner_visible, owner_seen_by = self._by_outfit(
             analysis.get("bodies") or [], owner_visible, owner_seen_by, someone_else, now
         )
+        place = self._place(frame, faces, analysis.get("bodies") or [])
 
         gesture = analysis.get("gesture")
         gesture_confidence = float(analysis.get("gesture_confidence") or 0.0)
@@ -1390,6 +1424,7 @@ class VisionWorker:
             self.state.owner_visible = owner_visible
             self.state.owner_confidence = round(owner_confidence, 4)
             self.state.owner_seen_by = owner_seen_by
+            self.state.place = place
             self.state.close_face_unidentified = close_unidentified
             self.state.brightness = float(analysis.get("brightness") or 0.0)
             self.state.dark = bool(analysis.get("dark", False))
@@ -1403,6 +1438,9 @@ class VisionWorker:
             self.state.sleep_state = sleep_state
             self.state.capabilities = dict(analysis.get("capabilities") or self.analyzer.capabilities)
             self.state.face_model_loaded = bool(self.state.capabilities.get("faces", False))
+            # Read again here: the worker's state is built before the models
+            # load, so the name it started with is only ever a placeholder.
+            self.state.face_model = str(getattr(self.analyzer, "face_model", self.state.face_model))
             snapshot = VisionState(**asdict(self.state))
         self.publish_state(snapshot)
         if sleep_state != previous_sleep and sleep_state in {"awake", "resting"}:
@@ -1455,6 +1493,25 @@ class VisionWorker:
         if outfit_distance(outfit, bodies[0]["outfit"]) <= OUTFIT_MATCH:
             return True, "outfit"
         return False, ""
+
+    def _place(self, frame: Any, faces: list[Dict[str, Any]], bodies: list[Dict[str, Any]]) -> str:
+        """Which zone the person is in -- the desk, the bed, the door -- or empty.
+
+        From the face when there is one and the body otherwise, and only for a
+        single person: with two, "where is he" has no one answer.
+        """
+        if not self.zones or frame is None or not hasattr(frame, "shape"):
+            return ""
+        boxes = [face.get("bbox") for face in faces] or [body.get("box") for body in bodies]
+        if len(boxes) != 1 or not boxes[0]:
+            return ""
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = boxes[0][:4]
+        point = ((x1 + x2) / 2 / width, (y1 + y2) / 2 / height)
+        for name, polygon in self.zones.items():
+            if _inside(point, polygon):
+                return name
+        return ""
 
     @staticmethod
     def _read_zones(zones: Any) -> Dict[str, list[list[float]]]:
