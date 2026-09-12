@@ -728,6 +728,9 @@ class Track:
         self.name = "unknown"
         self.score = 0.0
         self.recorded = False
+        #: (quality, liveness) per front-on frame, enforced or not.
+        self.observed: list[tuple[float, float]] = []
+        self.calibrated = False
 
     def add(self, embedding: list[float], weight: float, live: Optional[float]) -> None:
         self.samples = (self.samples + [(embedding, max(0.05, weight))])[-8:]
@@ -1350,9 +1353,10 @@ class VisionWorker:
                 # Only a face pointed at the lens says who it is. A turned one
                 # still moves the track, so it keeps the name it already has.
                 live = face.get("live")
-                if live is not None and not self.enforce_liveness:
-                    logger.debug("Liveness observed %.3f (not enforced)", float(live))
-                    live = None
+                if live is not None:
+                    track.observed.append((1.0 if quality is None else float(quality), float(live)))
+                    if not self.enforce_liveness:
+                        live = None
                 track.add(embedding, 1.0 if quality is None else float(quality), live)
             label = track.judge(self.library, self.confirm_frames)
             identities.append(track.name if label in ("owner", "known") else "unknown")
@@ -1360,6 +1364,20 @@ class VisionWorker:
                 owner_visible, owner_seen_by = True, "face"
                 owner_confidence = max(owner_confidence, track.score)
                 self._learn(face, embedding, quality, facing and reviewable, track)
+                if not track.calibrated and len(track.observed) >= 5:
+                    # Once per track, from frames known to be the owner: the
+                    # real distribution on this camera, which is what the
+                    # quality and liveness thresholds have to be set from.
+                    track.calibrated = True
+                    qualities = [q for q, _ in track.observed]
+                    lives = [v for _, v in track.observed]
+                    logger.info(
+                        "Owner face calibration: quality %.2f (min %.2f) liveness %.2f (min %.2f) "
+                        "over %d frames, brightness %.0f",
+                        sum(qualities) / len(qualities), min(qualities),
+                        sum(lives) / len(lives), min(lives), len(lives),
+                        float(analysis.get("brightness") or 0.0),
+                    )
             elif label in ("known", "unknown"):
                 someone_else = True
             box = face.get("bbox") or [0, 0, 0, 0]

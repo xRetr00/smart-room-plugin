@@ -325,3 +325,15 @@ def test_no_light_for_an_arrival_the_phone_already_identified() -> None:
     runtime._state.location.home = False
     runtime._state.location.last_geofence_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     assert runtime._wants_to_see(runtime._state.vision)
+
+
+def test_owner_frames_log_their_scores_for_calibration(tmp_path, caplog) -> None:
+    worker = _worker(tmp_path)
+    try:
+        with caplog.at_level("INFO"):
+            for _ in range(6):
+                _see(worker, _face(OWNER, live=0.4, quality=0.6))
+        lines = [r.message for r in caplog.records if "calibration" in r.message]
+        assert len(lines) == 1 and "liveness 0.40" in lines[0]
+    finally:
+        worker.stop()
