@@ -1310,9 +1310,50 @@ class VisionWorker:
         except Exception:
             return size
 
+    #: How long to wait before trying again when the models cannot load at all.
+    #: A camera that drops out comes back in seconds; a missing system library
+    #: does not come back until somebody installs it.
+    MODEL_RETRY_SECONDS = 300.0
+
+    def _models_problem(self) -> str:
+        """Why the models cannot load, in words a person can act on, or empty.
+
+        Asked before the camera is opened. The load used to happen inside the
+        capture loop, so a runtime that could not start opened the camera,
+        failed, released it and tried again every three seconds -- 300 times
+        on 13 September, when a Visual C++ runtime from 2022 was reinstalled
+        over a newer one and ONNX Runtime stopped loading. From the outside
+        that is a camera crashing over and over, and each round was also a
+        fresh "vision is broken" for the Gateway to announce.
+        """
+        if getattr(self.analyzer, "_face", None) is not None or not hasattr(self.analyzer, "load"):
+            return ""
+        try:
+            self.analyzer.load()
+            return ""
+        except (ImportError, OSError) as exc:
+            said = str(exc)
+            if "DLL" in said and ("initialization" in said or "onnxruntime" in said):
+                return (
+                    "The face models cannot start: this PC's Microsoft Visual C++ runtime is "
+                    "older than ONNX Runtime needs (14.40 or newer). Install the latest Visual "
+                    "C++ 2015-2022 x64 Redistributable from Microsoft, then restart Marvi."
+                )
+            return f"The face models cannot start: {said[:160]}"
+
     def _run(self) -> None:
         retry_seconds = max(1.0, float(self.config.get("reconnect_seconds", 3)))
+        told = ""
         while not self._stop.is_set():
+            problem = self._models_problem()
+            if problem:
+                if problem != told:
+                    logger.warning("Vision is waiting for its models: %s", problem)
+                    told = problem
+                self._set_state(running=True, camera_open=False, stale=True, error=problem[:300])
+                self._stop.wait(self.MODEL_RETRY_SECONDS)
+                continue
+            told = ""
             capture = None
             try:
                 capture = self._open_capture()

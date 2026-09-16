@@ -456,3 +456,47 @@ def test_somebody_found_again_in_bed_is_not_arriving(monkeypatch) -> None:
 
     emitted.assert_not_called()
     assert runtime._state.unreported_visitor_entries == []
+
+
+def test_models_that_cannot_load_never_open_the_camera(tmp_path) -> None:
+    """A missing system library used to cycle the camera every three seconds."""
+
+    class Broken:
+        capabilities = {"faces": False}
+        face_model = "x"
+        face_provider = "x"
+        _face = None
+
+        def load(self):
+            raise ImportError(
+                "DLL load failed while importing onnxruntime_pybind11_state: "
+                "A dynamic link library (DLL) initialization routine failed."
+            )
+
+    opened: list[int] = []
+    worker = VisionWorker(
+        {"enabled": True},
+        lambda _state: None,
+        lambda _kind, _data: None,
+        library=FaceLibrary(tmp_path / "vision"),
+        analyzer=Broken(),
+        capture_factory=lambda index: opened.append(index),
+    )
+    try:
+        problem = worker._models_problem()
+        assert "Visual C++" in problem and "Redistributable" in problem
+        waited: list[float] = []
+
+        def wait(seconds=None):
+            # One full turn of the loop, then stop.
+            waited.append(seconds)
+            worker._stop.set()
+            return True
+
+        worker._stop.wait = wait
+        worker._run()
+        assert waited == [VisionWorker.MODEL_RETRY_SECONDS], "retried on the camera's schedule"
+        assert opened == [], "opened the camera with no models to judge it"
+        assert "Visual C++" in (worker.state.error or "")
+    finally:
+        worker.stop()
