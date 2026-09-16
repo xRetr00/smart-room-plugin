@@ -500,3 +500,19 @@ def test_models_that_cannot_load_never_open_the_camera(tmp_path) -> None:
         assert "Visual C++" in (worker.state.error or "")
     finally:
         worker.stop()
+
+
+def test_a_welcome_is_only_said_when_the_room_knows_who_came_in(monkeypatch) -> None:
+    """"Welcome. Shereef isn't here right now", said into the room at 02:38
+    about the owner, because "guest" means "could not tell"."""
+    runtime = _runtime()
+    emitted = []
+    monkeypatch.setattr(runtime, "_emit_event", lambda kind, data: emitted.append((kind, data)))
+
+    runtime._publish_welcome(False, "Shereef", record_arrival=False, classification="guest")
+    runtime._publish_welcome(False, "Shereef", record_arrival=False, classification="unidentified")
+    assert emitted == []
+
+    runtime._publish_welcome(False, "Shereef", record_arrival=False, classification="unknown_visitor")
+    assert [kind for kind, _ in emitted] == ["room_welcome"]
+    assert emitted[0][1]["audience"] == "guest"

@@ -1016,6 +1016,7 @@ class Runtime:
             self._owner_name,
             record_arrival=True,
             visitor_entries=pending_entries,
+            classification=classification,
         )
 
     @staticmethod
@@ -1290,8 +1291,21 @@ class Runtime:
         *,
         record_arrival: bool,
         visitor_entries: Optional[list[Dict[str, Any]]] = None,
+        classification: str = "unknown_visitor",
     ) -> None:
-        """Publish a structured welcome event for Marvi to phrase and deliver."""
+        """Publish a structured welcome event for Marvi to phrase and deliver.
+
+        A guest welcome is said out loud, so it needs somebody to say it to.
+        "guest" and "unidentified" do not mean a guest: they mean the room
+        could not tell, which is usually the owner with a stale phone reading
+        and no face in front of the lens. Announced anyway, that became
+        "Welcome. Shereef isn't here right now" spoken into the room at 02:38
+        and again at 15:35 on 16 September, both of them him. The arrival
+        itself still reaches the Island, where a guess belongs.
+        """
+        if not owner_detected and classification not in ("unknown_visitor", "known_person"):
+            logger.info("No welcome: the room cannot tell who came in (%s)", classification)
+            return
         visitor_notice = self._visitor_notice(visitor_entries or []) if owner_detected else ""
         message = (
             f"Welcome back, {owner_name}." + (f" {visitor_notice}" if visitor_notice else "")

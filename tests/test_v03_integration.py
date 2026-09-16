@@ -268,6 +268,8 @@ def test_next_confirmed_owner_welcome_reports_and_clears_visitor_entries(monkeyp
             "classification": "unknown_visitor",
             "owner_phone_home": False,
         }],
+        # Carried so a welcome for somebody the room cannot name is not said.
+        classification="owner",
     )
     assert runtime._state.unreported_visitor_entries == []
 
